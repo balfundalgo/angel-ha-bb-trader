@@ -20,6 +20,7 @@ import os
 import time
 import math
 import json
+import random
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -212,13 +213,32 @@ def _fetch_native(token: str, exchange: str, interval: str,
         "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
         "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
     }
-    for attempt in range(config.RETRY["max_retries"]):
+    # Backoff schedule (seconds). Angel's getCandleData has a per-second limit
+    # AND a 180/minute cap that is shared across the whole client code, so a
+    # rate-limit denial may need a multi-second wait to clear. Jitter avoids
+    # two legs retrying in lockstep.
+    backoff = [2, 5, 10, 20, 30]
+    max_tries = len(backoff) + 1
+
+    def _is_rate_limit(text: str) -> bool:
+        t = text.lower()
+        return ("exceeding access rate" in t or "access denied" in t
+                or "access rate" in t or "rate" in t and "exceed" in t)
+
+    for attempt in range(max_tries):
         try:
             api_rate_limiter.wait("getCandleData")
             resp = obj.getCandleData(params)
             if not (isinstance(resp, dict) and resp.get("status")):
-                logger.warning(f"Candle API error ({token}): {resp}")
-                time.sleep(config.RETRY["base_delay"] * (attempt + 1))
+                msg = str(resp)
+                wait = backoff[min(attempt, len(backoff) - 1)]
+                if _is_rate_limit(msg):
+                    logger.warning(f"Rate limited on candles ({token}); "
+                                   f"backing off {wait}s "
+                                   f"(try {attempt+1}/{max_tries})")
+                else:
+                    logger.warning(f"Candle API error ({token}): {resp}")
+                time.sleep(wait + random.uniform(0, 1.0))
                 continue
             rows = resp.get("data") or []
             if not rows:
@@ -229,9 +249,15 @@ def _fetch_native(token: str, exchange: str, interval: str,
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             return df
         except Exception as e:
-            logger.error(f"getCandleData error ({token}) attempt "
-                         f"{attempt+1}: {e}")
-            time.sleep(config.RETRY["base_delay"] * (attempt + 1))
+            wait = backoff[min(attempt, len(backoff) - 1)]
+            if _is_rate_limit(str(e)):
+                logger.warning(f"Rate limited on candles ({token}); backing "
+                               f"off {wait}s (try {attempt+1}/{max_tries})")
+            else:
+                logger.error(f"getCandleData error ({token}) attempt "
+                             f"{attempt+1}: {e}")
+            time.sleep(wait + random.uniform(0, 1.0))
+    logger.error(f"getCandleData gave up for {token} after {max_tries} tries.")
     return pd.DataFrame(columns=_ANGEL_COLS)
 
 

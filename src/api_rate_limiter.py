@@ -80,8 +80,9 @@ class EndpointRateLimiter:
     def __init__(self, bucket_intervals: Optional[Dict[str, float]] = None):
         # Conservative but not slow. Tune if broker returns rate-limit errors.
         defaults = {
-            # Candles: Angel docs often allow higher, but be safe per instrument
-            "getCandleData": 0.38,   # ~2.6 calls/sec
+            # Candles: Angel enforces a per-second limit AND a 180/min cap
+            # shared across the whole client code. Stay well under it.
+            "getCandleData": 0.8,    # ~1.25 calls/sec
             # LTP: keep fast
             "ltpData": 0.12,         # ~8 calls/sec
             # Books / positions are typically stricter
