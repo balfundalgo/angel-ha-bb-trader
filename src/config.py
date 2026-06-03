@@ -137,3 +137,5 @@ def trades_file():
 # Runtime objects (set during a session)
 # ----------------------------------------------------------------------
 SMART = None     # SmartConnect object
+AUTH_TOKEN = None  # jwt token (for WebSocket auth)
+FEED_TOKEN = None  # feed token (for WebSocket auth)

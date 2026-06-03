@@ -39,6 +39,18 @@ index quote at the reference time, prefers a *moving* (live pre-open) tick, and
 falls back to the first available value — logging which source was used. Keep
 the app running before 09:07.
 
+### Market data: WebSocket-driven (no candle polling)
+To stay clear of Angel's `getCandleData` rate limit (3/sec, 180/min, **shared
+across your whole client code**), the app fetches history **once** at startup
+(one call per leg, just to seed the Bollinger warmup), then subscribes to the
+**WebSocket** and builds candles locally from the live tick stream. After
+startup it makes **zero** `getCandleData` calls, so it won't be throttled and
+won't compete with your other Angel apps for the candle budget.
+
+`candle_fetch_delay` (default 5s) is the grace period after each candle close
+for the first tick of the new candle to arrive and finalise the just-closed
+candle before the strategy reads it.
+
 ### Notes / assumptions
 - **SENSEX** options trade on **BFO** (BSE), strike step 100; NIFTY on NFO
   (step 50); BANKNIFTY on NFO (step 100). Lot size is read live from the scrip
@@ -73,6 +85,8 @@ src/
   api_rate_limiter.py  per-endpoint Angel rate limiter
   angel_connection.py  SmartAPI login / reconnect
   angel_data.py        scrip master, 09:07 capture, ATM resolve, candles
+  candle_builder.py    builds timeframe candles locally from WS ticks
+  angel_websocket.py   SmartWebSocketV2 feed -> tick callback
   indicators.py        Heiken Ashi + Bollinger (on HA close)
   strategy.py          per-leg state machine (unit-tested)
   order_manager.py     live + paper order execution + trade ledger

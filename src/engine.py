@@ -25,6 +25,8 @@ import angel_data as data
 from indicators import add_ha_bollinger
 from strategy import LegStrategy, LegConfig, State, ActionType
 from order_manager import OrderManager
+from candle_builder import CandleBuilder
+from angel_websocket import WebSocketFeed
 
 
 class TradingEngine:
@@ -37,6 +39,9 @@ class TradingEngine:
         self.instruments = {}          # 'CE'/'PE' -> instrument dict
         self.last_dt = {}              # 'CE'/'PE' -> last processed candle dt
         self.entry_px = {}             # 'CE'/'PE' -> current entry price
+        self.builders = {}             # 'CE'/'PE' -> CandleBuilder
+        self.token_to_leg = {}         # token -> 'CE'/'PE'
+        self.feed = None               # WebSocketFeed
         self.ref_spot = None
         self.atm = None
 
@@ -86,6 +91,7 @@ class TradingEngine:
 
             legs_wanted = (["CE", "PE"] if s["option_type"] == "BOTH"
                            else [s["option_type"]])
+            self.feed = WebSocketFeed(on_tick=self._on_tick)
             for leg in legs_wanted:
                 inst[leg]["leg"] = leg
                 self.instruments[leg] = inst[leg]
@@ -99,6 +105,26 @@ class TradingEngine:
                 self.legs[leg] = LegStrategy(cfg)
                 self.last_dt[leg] = None
 
+                # one-time historical fetch to SEED the BB warmup
+                builder = CandleBuilder(s["timeframe"], s["start_time"])
+                hist = data.get_option_candles(
+                    inst[leg]["token"], inst[leg]["exchange"], s["timeframe"],
+                    lookback_candles=s["bb_period"] + 40)
+                if hist is not None and not hist.empty:
+                    # exclude the still-forming last candle from the seed
+                    builder.seed(hist.iloc[:-1] if len(hist) > 1 else hist)
+                    logger.info(f"{leg}: seeded {builder.n_completed()} "
+                                f"historical candles for BB warmup.")
+                else:
+                    logger.warning(f"{leg}: no historical seed (will warm up "
+                                   f"from live ticks).")
+                self.builders[leg] = builder
+                self.token_to_leg[str(inst[leg]["token"])] = leg
+                self.feed.add_token(inst[leg]["token"], inst[leg]["exchange"])
+
+            # start the live feed (no more getCandleData after this)
+            self.feed.start()
+
             # 3) wait for start time, then candle loop
             self._wait_until(s["start_time"])
             self._candle_loop()
@@ -106,8 +132,16 @@ class TradingEngine:
         except Exception as e:
             logger.exception(f"Engine crashed: {e}")
         finally:
+            if self.feed:
+                self.feed.stop()
             self._push_status()
             logger.info("Engine stopped. Summary: %s", self.om.summary())
+
+    # ---------------- tick routing ----------------
+    def _on_tick(self, token, ltp, volume, ts):
+        leg = self.token_to_leg.get(str(token))
+        if leg and leg in self.builders:
+            self.builders[leg].update(ltp, volume, ts)
 
     # ---------------- candle loop ----------------
     def _candle_loop(self):
@@ -132,15 +166,15 @@ class TradingEngine:
                              or self._past(s["stop_entry_time"]))
 
             for leg, strat in self.legs.items():
-                inst = self.instruments[leg]
-                df = data.get_option_candles(
-                    inst["token"], inst["exchange"], tf,
-                    lookback_candles=s["bb_period"] + 40)
+                # candles now come from the LOCAL builder (WebSocket-driven),
+                # so no getCandleData calls happen inside the loop.
+                df = self.builders[leg].completed_df()
                 if df is None or df.empty or len(df) < 2:
                     continue
                 ha = add_ha_bollinger(df, s["bb_period"], s["bb_mult"])
-                # last CLOSED candle = second to last row (last row may be forming)
-                closed = ha.iloc[-2]
+                # last row here is the most recently CLOSED candle (the
+                # forming candle is not included in completed_df()).
+                closed = ha.iloc[-1]
                 cdt = closed.get("datetime")
                 if self.last_dt[leg] is not None and cdt == self.last_dt[leg]:
                     continue  # already processed
@@ -189,9 +223,7 @@ class TradingEngine:
                 qty = (strat.cfg.half_qty if strat.state == State.IN_RUNNER
                        else strat.cfg.total_qty)
                 inst = self.instruments[leg]
-                df = data.get_option_candles(inst["token"], inst["exchange"],
-                                             config.STRATEGY["timeframe"], 5)
-                px = float(df.iloc[-1]["close"]) if df is not None and not df.empty else 0.0
+                px = self.builders[leg].last_price or self.entry_px.get(leg, 0.0)
                 self.om.sell(inst, qty, px, reason, self.entry_px.get(leg, px))
                 strat._close_trade()
 

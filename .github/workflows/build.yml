@@ -38,6 +38,7 @@ jobs:
           --hidden-import pyotp
           --hidden-import logzero
           --hidden-import websocket
+          --hidden-import SmartApi.smartWebSocketV2
           --paths src
           src/main.py
 

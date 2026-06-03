@@ -44,6 +44,8 @@ class ConnectionManager:
                     self.connected = True
                     self.feed_token = obj.getfeedToken()
                     config.SMART = obj
+                    config.AUTH_TOKEN = data["data"].get("jwtToken")
+                    config.FEED_TOKEN = self.feed_token
                     logger.info("=" * 50)
                     logger.info(f"CONNECTED  |  client {c['client_id']}")
                     logger.info("=" * 50)
