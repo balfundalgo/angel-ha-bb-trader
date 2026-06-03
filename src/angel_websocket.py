@@ -68,6 +68,8 @@ class WebSocketFeed:
 
     # ------------------------------------------------------------------
     def _connect(self):
+        if self._stop:
+            return
         try:
             auth = getattr(config, "AUTH_TOKEN", None)
             feed = getattr(config, "FEED_TOKEN", None)
@@ -127,4 +129,6 @@ class WebSocketFeed:
         wait = min(30, self._reconnects * 5)
         logger.warning(f"WS reconnect attempt {self._reconnects} in {wait}s")
         time.sleep(wait)
+        if self._stop:                 # may have been stopped during the wait
+            return
         threading.Thread(target=self._connect, daemon=True).start()

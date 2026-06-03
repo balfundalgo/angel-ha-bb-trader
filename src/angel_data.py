@@ -244,7 +244,15 @@ def _fetch_native(token: str, exchange: str, interval: str,
             if not rows:
                 return pd.DataFrame(columns=_ANGEL_COLS)
             df = pd.DataFrame(rows, columns=_ANGEL_COLS)
-            df["datetime"] = pd.to_datetime(df["datetime"])
+            dt = pd.to_datetime(df["datetime"])
+            # Angel returns tz-aware IST (...+05:30); make naive so it matches
+            # the live tick candles (which use naive datetime.now()).
+            try:
+                if dt.dt.tz is not None:
+                    dt = dt.dt.tz_localize(None)
+            except (AttributeError, TypeError):
+                pass
+            df["datetime"] = dt
             for c in ("open", "high", "low", "close", "volume"):
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             return df

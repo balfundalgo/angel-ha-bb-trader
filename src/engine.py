@@ -166,31 +166,34 @@ class TradingEngine:
                              or self._past(s["stop_entry_time"]))
 
             for leg, strat in self.legs.items():
-                # candles now come from the LOCAL builder (WebSocket-driven),
-                # so no getCandleData calls happen inside the loop.
-                df = self.builders[leg].completed_df()
-                if df is None or df.empty or len(df) < 2:
-                    continue
-                ha = add_ha_bollinger(df, s["bb_period"], s["bb_mult"])
-                # last row here is the most recently CLOSED candle (the
-                # forming candle is not included in completed_df()).
-                closed = ha.iloc[-1]
-                cdt = closed.get("datetime")
-                if self.last_dt[leg] is not None and cdt == self.last_dt[leg]:
-                    continue  # already processed
-                self.last_dt[leg] = cdt
+                try:
+                    # candles come from the LOCAL builder (WebSocket-driven),
+                    # so no getCandleData calls happen inside the loop.
+                    df = self.builders[leg].completed_df()
+                    if df is None or df.empty or len(df) < 2:
+                        continue
+                    ha = add_ha_bollinger(df, s["bb_period"], s["bb_mult"])
+                    # last row here is the most recently CLOSED candle (the
+                    # forming candle is not included in completed_df()).
+                    closed = ha.iloc[-1]
+                    cdt = closed.get("datetime")
+                    if self.last_dt[leg] is not None and cdt == self.last_dt[leg]:
+                        continue  # already processed
+                    self.last_dt[leg] = cdt
 
-                row = {
-                    "ha_open": float(closed["ha_open"]),
-                    "ha_high": float(closed["ha_high"]),
-                    "ha_low": float(closed["ha_low"]),
-                    "ha_close": float(closed["ha_close"]),
-                    "ha_green": bool(closed["ha_green"]),
-                    "bb_upper": float(closed["bb_upper"]) if pd.notna(closed["bb_upper"]) else None,
-                    "bb_lower": float(closed["bb_lower"]) if pd.notna(closed["bb_lower"]) else None,
-                }
-                actions = strat.process_candle(row, block_entries)
-                self._execute(leg, actions)
+                    row = {
+                        "ha_open": float(closed["ha_open"]),
+                        "ha_high": float(closed["ha_high"]),
+                        "ha_low": float(closed["ha_low"]),
+                        "ha_close": float(closed["ha_close"]),
+                        "ha_green": bool(closed["ha_green"]),
+                        "bb_upper": float(closed["bb_upper"]) if pd.notna(closed["bb_upper"]) else None,
+                        "bb_lower": float(closed["bb_lower"]) if pd.notna(closed["bb_lower"]) else None,
+                    }
+                    actions = strat.process_candle(row, block_entries)
+                    self._execute(leg, actions)
+                except Exception as e:
+                    logger.error(f"[{leg}] cycle error (continuing): {e}")
 
             self._push_status()
 

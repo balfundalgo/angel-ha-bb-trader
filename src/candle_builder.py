@@ -57,9 +57,14 @@ class CandleBuilder:
         with self._lock:
             self._seed = []
             for _, r in df.iterrows():
+                dt = None
+                if "datetime" in r and r["datetime"] is not None:
+                    dt = pd.Timestamp(r["datetime"])
+                    if dt.tzinfo is not None:      # force naive (wall-clock IST)
+                        dt = dt.tz_localize(None)
+                    dt = dt.to_pydatetime()
                 self._seed.append({
-                    "datetime": pd.to_datetime(r["datetime"]).to_pydatetime()
-                    if "datetime" in r else None,
+                    "datetime": dt,
                     "open": float(r["open"]), "high": float(r["high"]),
                     "low": float(r["low"]), "close": float(r["close"]),
                     "volume": float(r.get("volume", 0) or 0),
