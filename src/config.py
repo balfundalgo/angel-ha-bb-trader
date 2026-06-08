@@ -127,6 +127,42 @@ SCRIP_MASTER_FILE = os.path.join(DATA_DIR, "scrip_master.json")
 SCRIP_MASTER_URL = ("https://margincalculator.angelbroking.com/"
                     "OpenAPI_File/files/OpenAPIScripMaster.json")
 
+# Settings persistence (saved next to the EXE / project root)
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+
+
+def save_settings() -> bool:
+    """Persist credentials + mode + strategy params to settings.json."""
+    import json
+    try:
+        data = {
+            "credentials": CREDENTIALS,
+            "trading_mode": TRADING_MODE,
+            "strategy": STRATEGY,
+        }
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def load_settings() -> bool:
+    """Load saved settings into CREDENTIALS / TRADING_MODE / STRATEGY."""
+    import json
+    global TRADING_MODE
+    if not os.path.exists(SETTINGS_FILE):
+        return False
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        CREDENTIALS.update(data.get("credentials", {}) or {})
+        TRADING_MODE = data.get("trading_mode", TRADING_MODE)
+        STRATEGY.update(data.get("strategy", {}) or {})
+        return True
+    except Exception:
+        return False
+
 def log_file():
     return os.path.join(LOG_DIR, f"trader_{datetime.now():%Y%m%d}.log")
 

@@ -32,6 +32,7 @@ class App(ctk.CTk):
         self.geometry("1080x760")
         self.configure(fg_color=BG)
         self.engine = None
+        config.load_settings()   # restore saved credentials + parameters
         self._build()
         set_gui_sink(self._log_line)
 
@@ -78,18 +79,27 @@ class App(ctk.CTk):
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=16, pady=4)
-        left = ctk.CTkScrollableFrame(body, fg_color="transparent", width=420)
-        left.pack(side="left", fill="y", padx=(0, 10))
+
+        # left column = scrollable fields on top + FIXED button bar at bottom
+        left_container = ctk.CTkFrame(body, fg_color="transparent", width=440)
+        left_container.pack(side="left", fill="y", padx=(0, 10))
+        left_container.pack_propagate(False)
+        footer = ctk.CTkFrame(left_container, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", pady=(8, 0))
+        left = ctk.CTkScrollableFrame(left_container, fg_color="transparent")
+        left.pack(side="top", fill="both", expand=True)
+
         right = ctk.CTkFrame(body, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True)
 
         # ----- credentials -----
         cred = self._card(left, "Angel One Credentials")
         cred.pack(fill="x", pady=6)
-        self.e_client = self._field(cred, "Client ID")
-        self.e_apikey = self._field(cred, "API Key")
-        self.e_mpin = self._field(cred, "MPIN", show="*")
-        self.e_totp = self._field(cred, "TOTP Secret", show="*")
+        c = config.CREDENTIALS
+        self.e_client = self._field(cred, "Client ID", c.get("client_id", ""))
+        self.e_apikey = self._field(cred, "API Key", c.get("api_key", ""))
+        self.e_mpin = self._field(cred, "MPIN", c.get("mpin", ""), show="*")
+        self.e_totp = self._field(cred, "TOTP Secret", c.get("totp_secret", ""), show="*")
         ctk.CTkLabel(cred, text="Credentials stay on this machine.",
                      text_color=SUB, font=("Segoe UI", 10)).pack(
             anchor="w", padx=16, pady=(0, 10))
@@ -116,8 +126,8 @@ class App(ctk.CTk):
         self.e_rr = self._field(strat, "Target R:R", st["rr_target"])
         self.e_max = self._field(strat, "Max trades", st["max_trades"])
 
-        btns = ctk.CTkFrame(left, fg_color="transparent")
-        btns.pack(fill="x", pady=10, padx=4)
+        btns = ctk.CTkFrame(footer, fg_color="transparent")
+        btns.pack(fill="x", pady=(4, 4), padx=4)
         self.btn_start = ctk.CTkButton(btns, text="Start", fg_color=ACCENT,
                                        hover_color="#1d4ed8", command=self._start)
         self.btn_start.pack(side="left", expand=True, fill="x", padx=4)
@@ -125,6 +135,11 @@ class App(ctk.CTk):
                                       hover_color=WARN, command=self._stop,
                                       state="disabled")
         self.btn_stop.pack(side="left", expand=True, fill="x", padx=4)
+
+        self.btn_save = ctk.CTkButton(footer, text="💾  Save Settings",
+                                      fg_color="#10b981", hover_color="#059669",
+                                      command=self._save_settings)
+        self.btn_save.pack(fill="x", pady=(0, 6), padx=4)
 
         # ----- status -----
         stat = self._card(right, "Live Status")
@@ -166,6 +181,17 @@ class App(ctk.CTk):
         s["rr_target"] = float(self.e_rr.get())
         s["max_trades"] = int(self.e_max.get())
 
+    def _save_settings(self):
+        try:
+            self._collect()
+        except ValueError as e:
+            logger.error(f"Invalid input, not saved: {e}")
+            return
+        if config.save_settings():
+            logger.info(f"Settings saved to {config.SETTINGS_FILE}")
+        else:
+            logger.error("Failed to save settings.")
+
     def _start(self):
         try:
             self._collect()
@@ -175,6 +201,7 @@ class App(ctk.CTk):
         if config.STRATEGY["lots"] % 2 != 0:
             logger.error("Lots must be an even number.")
             return
+        config.save_settings()   # auto-save so a good config persists
         logger.info("Starting engine...")
         self.engine = TradingEngine(status_cb=self._status)
         self.engine.start()
