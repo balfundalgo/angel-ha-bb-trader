@@ -28,13 +28,15 @@ WARN = "#dc2626"
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Balfund | Heiken Ashi + Bollinger Options Trader")
+        self.title(f"Balfund | HA + Bollinger Options Trader  (v{config.APP_VERSION})")
         self.geometry("1080x760")
         self.configure(fg_color=BG)
         self.engine = None
         config.load_settings()   # restore saved credentials + parameters
         self._build()
         set_gui_sink(self._log_line)
+        logger.info(f"App version v{config.APP_VERSION} ready.")
+        self.after(1000, self._tick_monitor)   # live P&L / trade panel poll
 
     # ------------------------------------------------------------------
     def _card(self, parent, title):
@@ -73,7 +75,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(self, text="Heiken Ashi + Bollinger Band Options Trader",
                      text_color=TXT, font=("Segoe UI Semibold", 22)).pack(
             anchor="w", padx=24, pady=(18, 2))
-        ctk.CTkLabel(self, text="ATM CE/PE buying · HA candles · BB on HA close",
+        ctk.CTkLabel(self, text=f"ATM CE/PE buying · HA candles · BB on HA close   —   v{config.APP_VERSION}",
                      text_color=SUB, font=("Segoe UI", 13)).pack(
             anchor="w", padx=24, pady=(0, 12))
 
@@ -140,6 +142,25 @@ class App(ctk.CTk):
                                       fg_color="#10b981", hover_color="#059669",
                                       command=self._save_settings)
         self.btn_save.pack(fill="x", pady=(0, 6), padx=4)
+
+        # ----- live P&L monitor (websocket-driven, polled 1s) -----
+        pnlc = self._card(right, "Live P&L")
+        pnlc.pack(fill="x", pady=6)
+        self.lbl_pnl_total = ctk.CTkLabel(pnlc, text="\u20b9 0.00",
+                                          text_color=OK, font=("Segoe UI Semibold", 30),
+                                          anchor="w")
+        self.lbl_pnl_total.pack(anchor="w", padx=16, pady=(0, 0))
+        self.lbl_pnl_sub = ctk.CTkLabel(pnlc, text="Realized: \u20b90.00    Unrealized: \u20b90.00",
+                                        text_color=SUB, font=("Segoe UI", 12), anchor="w")
+        self.lbl_pnl_sub.pack(anchor="w", padx=16, pady=(0, 12))
+
+        # ----- active trades panel -----
+        trc = self._card(right, "Active Trades")
+        trc.pack(fill="x", pady=6)
+        self.lbl_trades = ctk.CTkLabel(trc, text="(engine not started)",
+                                       text_color=TXT, font=("Consolas", 12),
+                                       justify="left", anchor="w")
+        self.lbl_trades.pack(anchor="w", padx=16, pady=(0, 12), fill="x")
 
         # ----- status -----
         stat = self._card(right, "Live Status")
@@ -231,6 +252,37 @@ class App(ctk.CTk):
     def _log_line(self, line):
         self.after(0, lambda: (self.txt.insert("end", line + "\n"),
                                self.txt.see("end")))
+
+    # ---------------- live P&L + trade panel (read-only, 1s poll) --------
+    def _tick_monitor(self):
+        try:
+            if self.engine is not None:
+                self._render_live(self.engine.live_snapshot())
+        except Exception:
+            pass
+        self.after(1000, self._tick_monitor)
+
+    def _render_live(self, snap):
+        total = snap["total"]
+        color = OK if total >= 0 else WARN
+        self.lbl_pnl_total.configure(text=f"\u20b9 {total:,.2f}", text_color=color)
+        self.lbl_pnl_sub.configure(
+            text=f"Realized: \u20b9{snap['realized']:,.2f}    "
+                 f"Unrealized: \u20b9{snap['unrealized']:,.2f}")
+
+        header = (f"{'Leg':<4}{'Symbol':<22}{'State':<11}"
+                  f"{'Entry':>9}{'LTP':>9}{'Qty':>6}{'SL':>9}{'P&L':>11}")
+        rows = [header, "-" * len(header)]
+        if not snap["legs"]:
+            rows.append("(engine not started)")
+        for lg in snap["legs"]:
+            e = f"{lg['entry']:.2f}" if lg["entry"] else "-"
+            l = f"{lg['ltp']:.2f}" if lg["ltp"] else "-"
+            sl = f"{lg['sl']:.2f}" if lg["sl"] else "-"
+            rows.append(
+                f"{lg['leg']:<4}{lg['symbol']:<22}{lg['state']:<11}"
+                f"{e:>9}{l:>9}{lg['qty']:>6}{sl:>9}{lg['unrealized']:>+11.2f}")
+        self.lbl_trades.configure(text="\n".join(rows))
 
 
 def run():

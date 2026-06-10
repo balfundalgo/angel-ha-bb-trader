@@ -274,3 +274,44 @@ class TradingEngine:
             "legs": legs_info,
             "pnl": self.om.summary()["realized_pnl"],
         })
+
+    # ---------------- read-only live snapshot (for GUI monitor) ----------
+    # Pure read of existing values; does NOT alter any trading logic.
+    def live_snapshot(self):
+        realized = self.om.realized if self.om else 0.0
+        unrealized_total = 0.0
+        legs = []
+        for leg, strat in self.legs.items():
+            ltp = self.builders[leg].last_price if leg in self.builders else None
+            entry = strat.entry_price
+            if strat.state == State.IN_FULL:
+                qty = strat.cfg.total_qty
+            elif strat.state == State.IN_RUNNER:
+                qty = strat.cfg.half_qty
+            else:
+                qty = 0
+            unreal = 0.0
+            if qty and entry and ltp:
+                unreal = (ltp - entry) * qty            # long option position
+                unrealized_total += unreal
+            legs.append({
+                "leg": leg,
+                "symbol": self.instruments[leg]["symbol"] if leg in self.instruments else "",
+                "state": strat.state.value,
+                "entry": entry,
+                "ltp": ltp,
+                "qty": qty,
+                "sl": strat.stop_loss,
+                "t1": strat.t1_level,
+                "unrealized": unreal,
+            })
+        return {
+            "mode": config.TRADING_MODE,
+            "atm": self.atm,
+            "ref_spot": self.ref_spot,
+            "realized": realized,
+            "unrealized": unrealized_total,
+            "total": realized + unrealized_total,
+            "legs": legs,
+            "running": bool(self.thread and self.thread.is_alive()),
+        }
