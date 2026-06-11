@@ -283,7 +283,9 @@ class TradingEngine:
         legs = []
         for leg, strat in self.legs.items():
             ltp = self.builders[leg].last_price if leg in self.builders else None
-            entry = strat.entry_price
+            # entry: actual fill price once in a trade; planned entry level
+            # while ARMED/waiting (so the panel is never blank mid-setup).
+            entry = strat.entry_price if strat.entry_price is not None else strat.entry_level
             if strat.state == State.IN_FULL:
                 qty = strat.cfg.total_qty
             elif strat.state == State.IN_RUNNER:
@@ -291,8 +293,8 @@ class TradingEngine:
             else:
                 qty = 0
             unreal = 0.0
-            if qty and entry and ltp:
-                unreal = (ltp - entry) * qty            # long option position
+            if qty and strat.entry_price and ltp:
+                unreal = (ltp - strat.entry_price) * qty   # long option position
                 unrealized_total += unreal
             legs.append({
                 "leg": leg,

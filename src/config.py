@@ -28,7 +28,7 @@ TRADING_MODE = "PAPER"
 
 # Version stamp (shown in the GUI title + logged at startup so you can tell
 # which build is actually running).
-APP_VERSION = "1.4.0-monitor"
+APP_VERSION = "1.4.1-monitor"
 
 # ----------------------------------------------------------------------
 # Index specifications
