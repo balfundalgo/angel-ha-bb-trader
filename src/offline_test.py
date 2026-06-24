@@ -1,171 +1,121 @@
 """
 offline_test.py
 ===============
-Test the Heiken Ashi + Bollinger Band strategy in VSCode WITHOUT any broker
-connection. Runs the exact same indicators.py + strategy.py logic the live
-engine uses, on either synthetic option-premium candles or your own CSV.
-
-This lets you verify the entry/SL/target/trail behaviour any time of day.
+Test the NEW tick-based Heiken Ashi + Bollinger strategy in VSCode without a
+broker. Signal detection runs on HA candle close; execution is simulated by
+replaying intra-candle "ticks" (open -> high -> low -> close) through the same
+process_tick() the live engine uses.
 
 USAGE
 -----
-1) Synthetic demo (default):
-       python src/offline_test.py
+    python src/offline_test.py                 # built-in synthetic sample
+    python src/offline_test.py candles.csv     # your own CSV (datetime,open,high,low,close)
 
-2) Your own CSV of option candles:
-       python src/offline_test.py path/to/option_candles.csv
-   CSV must have columns (case-insensitive):
-       datetime, open, high, low, close   (volume optional)
-   One row per candle of the timeframe you want to test.
-
-It prints every signal/order event and a final summary. Tweak the CONFIG
-block below to match the parameters you set in the GUI.
+Tune CONFIG below to match your GUI settings. Lots are pairs (1 lot = 2 units),
+and the target is in PREMIUM POINTS (half booked at half the target).
 """
 
 from __future__ import annotations
 import sys
 import os
-import math
-
 import numpy as np
 import pandas as pd
 
-# allow running both as `python src/offline_test.py` and from inside src/
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from indicators import add_ha_bollinger
 from strategy import LegStrategy, LegConfig, State, ActionType
 
-
-# ======================================================================
-# CONFIG  — match these to your GUI settings
-# ======================================================================
 CONFIG = {
-    "bb_period": 20,
-    "bb_mult": 2.0,
-    "lots": 2,          # must be even
-    "lot_size": 75,     # NIFTY=75, BANKNIFTY=15/30, SENSEX=20 (check scrip master)
-    "entry_pct": 0.05,  # 5% above trigger HA high
-    "sl_buffer": 5.0,   # points below red HA low
-    "trail_step": 5.0,  # points per trail step
-    "rr_target": 2.0,   # 1:2
-    "max_trades": 4,    # cap for this leg in the test
+    "bb_period": 20, "bb_mult": 2.0,
+    "lots": 1, "lot_size": 65,
+    "entry_pct": 0.05, "sl_buffer": 5.0,
+    "trail_step": 5.0, "target_points": 40.0,
+    "max_trades": 4,
 }
 
 
-# ======================================================================
-# Sample data generator (a clean red-below-band -> green bounce -> rally)
-# ======================================================================
 def make_sample_candles(n_warmup: int = 22) -> pd.DataFrame:
-    """
-    Build a deterministic option-premium series that contains a textbook
-    setup so you can see every state transition fire.
-    """
-    # flat-ish warmup so the bands are tight
-    warm = []
-    base = 100.0
-    flips = [0, 1, -1, 0, 1, -1, 0, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 0, 1, -1, 0, 1]
-    for k in range(n_warmup):
-        warm.append(base + flips[k % len(flips)])
-    # drop below band, green recovery, then rally through the upper band
+    flips = [0,1,-1,0,1,-1,0,0,1,-1,0,1,-1,0,1,-1,0,0,1,-1,0,1]
+    warm = [100.0 + flips[k % len(flips)] for k in range(n_warmup)]
     move = [90, 96, 110, 130, 160, 200, 210]
     close = np.array(warm + move, dtype=float)
-
     op = np.r_[close[0], close[:-1]]
     hi = np.maximum(op, close) + 1.0
     lo = np.minimum(op, close) - 1.0
-    dt = pd.date_range("2026-05-29 09:15", periods=len(close), freq="5min")
-    return pd.DataFrame(
-        {"datetime": dt, "open": op, "high": hi, "low": lo,
-         "close": close, "volume": 100}
-    )
+    dt = pd.date_range("2026-06-23 09:15", periods=len(close), freq="5min")
+    return pd.DataFrame({"datetime": dt, "open": op, "high": hi, "low": lo,
+                         "close": close, "volume": 100})
 
 
 def load_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df.columns = [c.lower().strip() for c in df.columns]
-    need = {"open", "high", "low", "close"}
-    if not need.issubset(df.columns):
-        raise SystemExit(f"CSV must contain columns {need}; got {set(df.columns)}")
+    if not {"open","high","low","close"}.issubset(df.columns):
+        raise SystemExit("CSV needs columns: open, high, low, close (datetime optional)")
     if "datetime" not in df.columns:
-        df["datetime"] = pd.date_range("2026-05-29 09:15", periods=len(df),
-                                       freq="5min")
+        df["datetime"] = pd.date_range("2026-06-23 09:15", periods=len(df), freq="5min")
     return df
 
 
-# ======================================================================
-# Runner
-# ======================================================================
 def run(df: pd.DataFrame):
-    if CONFIG["lots"] % 2 != 0:
-        raise SystemExit("lots must be even.")
-
     ha = add_ha_bollinger(df, CONFIG["bb_period"], CONFIG["bb_mult"])
-
-    cfg = LegConfig(
-        leg="TEST", lots=CONFIG["lots"], lot_size=CONFIG["lot_size"],
-        entry_pct=CONFIG["entry_pct"], sl_buffer=CONFIG["sl_buffer"],
-        trail_step=CONFIG["trail_step"], rr_target=CONFIG["rr_target"],
-    )
-    strat = LegStrategy(cfg)
-
+    cfg = LegConfig(leg="TEST", lots=CONFIG["lots"], lot_size=CONFIG["lot_size"],
+                    entry_pct=CONFIG["entry_pct"], sl_buffer=CONFIG["sl_buffer"],
+                    trail_step=CONFIG["trail_step"], target_points=CONFIG["target_points"])
+    s = LegStrategy(cfg)
     realized = 0.0
     entry_px = None
-    fills = 0
 
-    print("=" * 92)
-    print(f"Candles: {len(ha)} | BB({CONFIG['bb_period']},{CONFIG['bb_mult']}) "
-          f"on HA close | lots={CONFIG['lots']} x {CONFIG['lot_size']} "
-          f"| entry +{CONFIG['entry_pct']*100:g}% | SL buf {CONFIG['sl_buffer']} "
-          f"| trail {CONFIG['trail_step']} | RR 1:{CONFIG['rr_target']:g}")
-    print("=" * 92)
+    print("=" * 90)
+    print(f"qty/trade = {cfg.total_qty} (half {cfg.half_qty}) | entry +{cfg.entry_pct*100:g}% "
+          f"| SL buf {cfg.sl_buffer} | target {cfg.target_points}pts "
+          f"(book half at {cfg.target_points/2:g}) | trail {cfg.trail_step}")
+    print("Execution replays intra-candle ticks: open -> high -> low -> close")
+    print("=" * 90)
+
+    def emit(a, ts):
+        nonlocal realized, entry_px
+        if a.type == ActionType.ENTER:
+            entry_px = a.price
+            print(f"[{ts}] ENTER     {a.qty:>4} @ {a.price:>8.2f} | {a.reason}")
+        elif a.type == ActionType.BOOK_HALF:
+            realized += (a.price - entry_px) * a.qty
+            print(f"[{ts}] BOOK_HALF {a.qty:>4} @ {a.price:>8.2f} | pnl {(a.price-entry_px)*a.qty:+.0f} | {a.reason}")
+        elif a.type == ActionType.EXIT_ALL:
+            realized += (a.price - entry_px) * a.qty if entry_px else 0.0
+            print(f"[{ts}] EXIT      {a.qty:>4} @ {a.price:>8.2f} | pnl {(a.price-entry_px)*a.qty:+.0f} | {a.reason}")
+            entry_px = None
+        elif a.type == ActionType.MODIFY_SL:
+            print(f"[{ts}] SL ->          {a.price:>8.2f} | {a.reason}")
+        elif a.type in (ActionType.CANCEL, ActionType.INFO):
+            print(f"[{ts}] {a.type.value:9s}             | {a.reason}")
 
     for i in range(len(ha)):
         r = ha.iloc[i]
-        row = {
-            "ha_open": float(r["ha_open"]), "ha_high": float(r["ha_high"]),
-            "ha_low": float(r["ha_low"]), "ha_close": float(r["ha_close"]),
-            "ha_green": bool(r["ha_green"]),
-            "bb_upper": float(r["bb_upper"]) if pd.notna(r["bb_upper"]) else None,
-            "bb_lower": float(r["bb_lower"]) if pd.notna(r["bb_lower"]) else None,
-        }
-        max_reached = strat.trades_taken >= CONFIG["max_trades"]
-        for a in strat.process_candle(row, max_reached):
-            ts = str(r["datetime"])[:16]
-            if a.type == ActionType.ENTER:
-                entry_px = a.price
-                fills += 1
-                print(f"[{ts}] c{i:>3} ENTER     {a.qty:>4} @ {a.price:>8.2f}  | {a.reason}")
-            elif a.type == ActionType.BOOK_HALF:
-                pnl = (a.price - entry_px) * a.qty
-                realized += pnl
-                print(f"[{ts}] c{i:>3} BOOK_HALF {a.qty:>4} @ {a.price:>8.2f}  "
-                      f"| pnl {pnl:+.2f} | {a.reason}")
-            elif a.type == ActionType.EXIT_ALL:
-                pnl = (a.price - entry_px) * a.qty if entry_px else 0.0
-                realized += pnl
-                print(f"[{ts}] c{i:>3} EXIT_ALL  {a.qty:>4} @ {a.price:>8.2f}  "
-                      f"| pnl {pnl:+.2f} | {a.reason}")
-                entry_px = None
-            elif a.type == ActionType.MODIFY_SL:
-                print(f"[{ts}] c{i:>3} MODIFY_SL      @ {a.price:>8.2f}  | {a.reason}")
-            elif a.type == ActionType.CANCEL:
-                print(f"[{ts}] c{i:>3} CANCEL                       | {a.reason}")
-            else:  # INFO
-                print(f"[{ts}] c{i:>3} info                          | {a.reason}")
+        ts = str(r["datetime"])[:16]
+        row = {"ha_open": float(r.ha_open), "ha_high": float(r.ha_high),
+               "ha_low": float(r.ha_low), "ha_close": float(r.ha_close),
+               "ha_green": bool(r.ha_green),
+               "bb_lower": float(r.bb_lower) if pd.notna(r.bb_lower) else None,
+               "bb_upper": float(r.bb_upper) if pd.notna(r.bb_upper) else None}
+        for a in s.process_candle(row):
+            emit(a, ts)
+        blocked = s.trades_taken >= CONFIG["max_trades"]
+        for px in (row["ha_open"], row["ha_high"], row["ha_low"], row["ha_close"]):
+            for a in s.process_tick(px, entries_blocked=blocked):
+                emit(a, ts)
+            blocked = s.trades_taken >= CONFIG["max_trades"]
 
-    print("=" * 92)
-    print(f"Entries taken: {strat.trades_taken} | fills: {fills} "
-          f"| final state: {strat.state.value} "
-          f"| realized P&L (points*qty): {realized:+.2f}")
-    print("=" * 92)
+    print("=" * 90)
+    print(f"Entries: {s.trades_taken} | final state: {s.state.value} "
+          f"| realized P&L (pts*qty): {realized:+.2f}")
+    print("=" * 90)
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        data = load_csv(sys.argv[1])
-        print(f"Loaded {len(data)} candles from {sys.argv[1]}")
+        data = load_csv(sys.argv[1]); print(f"Loaded {len(data)} candles")
     else:
-        data = make_sample_candles()
-        print("Using built-in synthetic sample (pass a CSV path to use your own).")
+        data = make_sample_candles(); print("Built-in synthetic sample.")
     run(data)

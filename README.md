@@ -11,56 +11,36 @@ upper band. NIFTY / BANKNIFTY / SENSEX, selectable timeframe, paper or live.
 
 ## Strategy (as implemented)
 
-1. **ATM selection** — at the reference time (default **09:07**, NSE pre-open
-   window) the spot is captured live and the ATM strike is locked.
-2. **Charts** — everything runs on the **option strike's** chart using
-   **Heiken Ashi** candles; **Bollinger Bands** are computed on the **HA close**
-   (period/multiplier configurable; population std to match the broker).
-3. **Entry**
-   - A **red** HA candle closes **below** the lower band → *alert*.
-   - The first **green** HA candle after it that closes **above** the lower band
-     → *trigger*.
-   - Entry level = trigger HA high **+ 5%** (configurable). Fires when a later
-     candle's HA high reaches it.
-   - **Stop loss** = alert(red) candle HA low − buffer (points, configurable).
-   - **Cancel** if any candle's HA low hits the SL before entry fills.
-4. **Management**
-   - **T1 = 1:2** → book **half** the lots, move remaining SL to **breakeven**.
-   - **Trail** — reference is the T1 level; for every **+5 points above T1**,
-     raise SL by **5 points** from breakeven.
-   - **Overall target = upper band** → exit remaining there.
-5. **Max trades** — combined CE+PE cap per day (configurable).
-6. Both CE and PE legs run **simultaneously** when "Option side = BOTH".
+Everything runs on the **option strike's** chart using **Heiken Ashi** candles;
+**Bollinger Bands** are computed on the **HA close**.
 
-### On the 09:07 price
-The historical candle API has **no 09:07 candle** (candles start 09:15), so this
-value can only be captured **live** while the app is running. The app polls the
-index quote at the reference time, prefers a *moving* (live pre-open) tick, and
-falls back to the first available value — logging which source was used. Keep
-the app running before 09:07.
+1. **ATM selection** - at the reference time (default 09:07, pre-open) the spot
+   is captured live and the ATM strike is locked. CE and PE run simultaneously.
+2. **Signal detection (on HA candle close):**
+   - **Alert**: a RED HA candle closes BELOW the lower band.
+   - **Trigger**: the FIRST GREEN HA candle after the alert (no band condition).
+     On trigger, the setup is armed: entry level = trigger HA high + 5%,
+     stop loss = alert(red) HA low - buffer.
+3. **Execution (on live ticks / LTP):**
+   - **Cancel**: LTP hits the SL before entry -> void the setup.
+   - **Entry**: LTP crosses the entry level -> buy immediately (no candle wait).
+     Quantity = lots x 2 x lot_size (1 lot = 2 units; "half" is always exact).
+   - **Book half**: LTP reaches entry + (target/2) -> sell half, move remaining
+     SL to breakeven.
+   - **Trail**: from the book-half level, raise SL by `trail_step` for every
+     `trail_step` points of favourable move.
+   - **Full target**: LTP reaches entry + target points -> exit remaining half.
+   - The remaining half exits on whichever comes first: trailing stop or target.
+   - **SL exit** any time LTP hits the current SL.
+4. **Max trades** (combined CE+PE), time gates, and square-off as configured.
 
-### Market data: WebSocket-driven (no candle polling)
-To stay clear of Angel's `getCandleData` rate limit (3/sec, 180/min, **shared
-across your whole client code**), the app fetches history **once** at startup
-(one call per leg, just to seed the Bollinger warmup), then subscribes to the
-**WebSocket** and builds candles locally from the live tick stream. After
-startup it makes **zero** `getCandleData` calls, so it won't be throttled and
-won't compete with your other Angel apps for the candle budget.
+Target is set in **premium points** (GUI field "Target (points)"). The old 1:2
+R:R and the upper-Bollinger-band target have been removed.
 
-`candle_fetch_delay` (default 5s) is the grace period after each candle close
-for the first tick of the new candle to arrive and finalise the just-closed
-candle before the strategy reads it.
+> NOTE: entries and exits are **tick-driven** with no candle-close backstop. If
+> the tick feed drops while a position is open, a stop/target may not fire until
+> ticks resume.
 
-### Notes / assumptions
-- **SENSEX** options trade on **BFO** (BSE), strike step 100; NIFTY on NFO
-  (step 50); BANKNIFTY on NFO (step 100). Lot size is read live from the scrip
-  master, not hardcoded.
-- **4-hour** is not a native Angel interval — it is resampled from 1-hour,
-  anchored to the 09:15 session start.
-- **Lots must be even** (so "half" is exact).
-- **Paper mode still needs a live Angel connection** for real market data.
-
----
 
 ## Run from source
 ```bash

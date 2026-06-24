@@ -41,6 +41,7 @@ class TradingEngine:
         self.entry_px = {}             # 'CE'/'PE' -> current entry price
         self.builders = {}             # 'CE'/'PE' -> CandleBuilder
         self.token_to_leg = {}         # token -> 'CE'/'PE'
+        self.locks = {}                # 'CE'/'PE' -> threading.Lock (candle vs tick)
         self.feed = None               # WebSocketFeed
         self.ref_spot = None
         self.atm = None
@@ -98,12 +99,15 @@ class TradingEngine:
                 cfg = LegConfig(
                     leg=leg, lots=s["lots"], lot_size=inst[leg]["lotsize"],
                     entry_pct=s["entry_pct"], sl_buffer=s["sl_buffer"],
-                    trail_step=s["trail_step"], rr_target=s["rr_target"],
+                    trail_step=s["trail_step"], target_points=s["target_points"],
                 )
-                if cfg.lots % 2 != 0:
-                    logger.warning(f"{leg}: lots must be even; got {cfg.lots}.")
                 self.legs[leg] = LegStrategy(cfg)
+                self.locks[leg] = threading.Lock()
                 self.last_dt[leg] = None
+                logger.info(f"{leg}: {cfg.lots} lot(s) x2 x {cfg.lot_size} = "
+                            f"{cfg.total_qty} qty (half {cfg.half_qty}); "
+                            f"target {cfg.target_points}pts, book-half at "
+                            f"{cfg.target_points/2:.0f}pts")
 
                 # one-time historical fetch to SEED the BB warmup
                 builder = CandleBuilder(s["timeframe"], s["start_time"])
@@ -137,11 +141,35 @@ class TradingEngine:
             self._push_status()
             logger.info("Engine stopped. Summary: %s", self.om.summary())
 
-    # ---------------- tick routing ----------------
+    # ---------------- tick routing (all execution happens here) ----------
     def _on_tick(self, token, ltp, volume, ts):
         leg = self.token_to_leg.get(str(token))
-        if leg and leg in self.builders:
-            self.builders[leg].update(ltp, volume, ts)
+        if not leg or leg not in self.builders:
+            return
+        self.builders[leg].update(ltp, volume, ts)
+
+        strat = self.legs.get(leg)
+        if strat is None:
+            return
+        # only the execution states care about ticks
+        from strategy import State as _St
+        if strat.state not in (_St.ARMED, _St.IN_FULL, _St.IN_RUNNER):
+            return
+        lock = self.locks.get(leg)
+        if lock is None or not lock.acquire(blocking=False):
+            return  # candle thread holds it for this leg; next tick will retry
+        try:
+            actions = strat.process_tick(ltp, self._entries_blocked())
+            if actions:
+                self._execute(leg, actions)
+                self._push_status()
+        finally:
+            lock.release()
+
+    def _entries_blocked(self):
+        s = config.STRATEGY
+        combined = sum(l.trades_taken for l in self.legs.values())
+        return combined >= s["max_trades"] or self._past(s["stop_entry_time"])
 
     # ---------------- candle loop ----------------
     def _candle_loop(self):
@@ -160,10 +188,6 @@ class TradingEngine:
             self._sleep_to_next_candle(tf, delay)
             if self._stop.is_set():
                 break
-
-            combined_trades = sum(l.trades_taken for l in self.legs.values())
-            block_entries = (combined_trades >= s["max_trades"]
-                             or self._past(s["stop_entry_time"]))
 
             for leg, strat in self.legs.items():
                 try:
@@ -190,8 +214,11 @@ class TradingEngine:
                         "bb_upper": float(closed["bb_upper"]) if pd.notna(closed["bb_upper"]) else None,
                         "bb_lower": float(closed["bb_lower"]) if pd.notna(closed["bb_lower"]) else None,
                     }
-                    actions = strat.process_candle(row, block_entries)
-                    self._execute(leg, actions)
+                    # candle close only detects signals / arms the setup;
+                    # all entries and exits run on ticks (process_tick).
+                    with self.locks[leg]:
+                        actions = strat.process_candle(row)
+                        self._execute(leg, actions)
                 except Exception as e:
                     logger.error(f"[{leg}] cycle error (continuing): {e}")
 
@@ -222,13 +249,14 @@ class TradingEngine:
 
     def _square_off_all(self, reason):
         for leg, strat in self.legs.items():
-            if strat.state in (State.IN_FULL, State.IN_RUNNER):
-                qty = (strat.cfg.half_qty if strat.state == State.IN_RUNNER
-                       else strat.cfg.total_qty)
-                inst = self.instruments[leg]
-                px = self.builders[leg].last_price or self.entry_px.get(leg, 0.0)
-                self.om.sell(inst, qty, px, reason, self.entry_px.get(leg, px))
-                strat._close_trade()
+            with self.locks[leg]:
+                if strat.state in (State.IN_FULL, State.IN_RUNNER):
+                    qty = (strat.cfg.half_qty if strat.state == State.IN_RUNNER
+                           else strat.cfg.total_qty)
+                    inst = self.instruments[leg]
+                    px = self.builders[leg].last_price or self.entry_px.get(leg, 0.0)
+                    self.om.sell(inst, qty, px, reason, self.entry_px.get(leg, px))
+                    strat._close_trade()
 
     # ---------------- timing helpers ----------------
     def _now_hm(self):
@@ -264,7 +292,7 @@ class TradingEngine:
                 "symbol": self.instruments[leg]["symbol"],
                 "sl": strat.stop_loss,
                 "entry": strat.entry_price,
-                "t1": strat.t1_level,
+                "target": strat.full_target,
                 "trades": strat.trades_taken,
             }
         self.status_cb({
@@ -304,7 +332,7 @@ class TradingEngine:
                 "ltp": ltp,
                 "qty": qty,
                 "sl": strat.stop_loss,
-                "t1": strat.t1_level,
+                "target": strat.full_target,
                 "unrealized": unreal,
             })
         return {

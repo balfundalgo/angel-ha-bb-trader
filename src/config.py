@@ -28,7 +28,7 @@ TRADING_MODE = "PAPER"
 
 # Version stamp (shown in the GUI title + logged at startup so you can tell
 # which build is actually running).
-APP_VERSION = "1.4.1-monitor"
+APP_VERSION = "1.5.0-ticktrade"
 
 # ----------------------------------------------------------------------
 # Index specifications
@@ -89,11 +89,11 @@ STRATEGY = {
     "bb_period": 20,
     "bb_mult": 2.0,
 
-    "lots": 2,                  # MUST be even
+    "lots": 1,                  # 1 lot = 2 units (pairs)
     "entry_pct": 0.05,          # 5% above trigger high
     "sl_buffer": 5.0,           # points
     "trail_step": 5.0,          # points
-    "rr_target": 2.0,           # 1:2
+    "target_points": 30.0,      # FULL target in premium points (book half at half)
 
     "max_trades": 4,            # total entries per day (CE + PE combined)
 
