@@ -10,7 +10,9 @@ Signal detection runs on HA candle CLOSE (process_candle):
   * Trigger : the FIRST GREEN HA candle after the alert (no band condition).
               On trigger we ARM the setup and lock:
                   entry_level = trigger HA high * (1 + entry_pct)   (default +5%)
-                  stop_loss   = alert(red) HA low - sl_buffer
+                  stop_loss   = (low of the LAST RED candle before the green) - sl_buffer
+              The SL red is the most recent red candle at trigger time (band
+              irrelevant for the SL; the alert still requires below-band).
 
 Execution runs on every TICK / live LTP (process_tick):
   * Cancel   : LTP hits SL before entry  -> void the setup.
@@ -143,14 +145,17 @@ class LegStrategy:
             return actions
 
         if self.state == State.WAIT_TRIGGER:
-            # keep the most recent red-below-band low as the SL reference
-            if (not green) and ha_close < bb_lower:
+            # After the alert, track the low of the MOST RECENT red candle
+            # (band irrelevant here) so the SL anchors to the red immediately
+            # before the green trigger.
+            if not green:
                 self.alert_low = ha_low
                 return actions
             # trigger: FIRST green HA candle after the alert (no band condition)
             if green:
                 self.trigger_high = ha_high
                 self.entry_level = round(self.trigger_high * (1 + self.cfg.entry_pct), 2)
+                # SL = low of the just-previous red candle - buffer
                 self.stop_loss = round(self.alert_low - self.cfg.sl_buffer, 2)
                 self.state = State.ARMED
                 actions.append(Action(ActionType.INFO, 0, 0,
