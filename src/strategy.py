@@ -18,16 +18,17 @@ Execution runs on every TICK / live LTP (process_tick):
   * Cancel   : LTP hits SL before entry  -> void the setup.
   * Entry    : LTP crosses entry_level   -> buy immediately.
                qty = lots * 2 * lot_size  (1 lot = 2 units; "half" is exact).
-  * Book half: LTP reaches entry + target_points/2 -> sell half,
+  * Book half: LTP reaches entry + book_half_points -> sell half,
                move remaining SL to breakeven (entry).
   * Trail    : after book-half, measured FROM the book-half level: for every
                +trail_step points, raise SL by trail_step from breakeven.
-  * Target   : LTP reaches entry + target_points -> exit the remaining half.
+               OPEN-ENDED — there is no full target; the runner rides the trail.
   * SL exit  : LTP hits the current SL at any time.
-  The remaining half exits on whichever comes first: trailing stop or target.
+  The remaining half exits only on the trailing stop (or EOD square-off).
 
-REMOVED vs the old version: the 1:2 R:R target and the upper-Bollinger-band
-target. Entries/exits are no longer evaluated on candle close.
+REMOVED vs earlier versions: the 1:2 R:R target, the upper-Bollinger-band
+target, AND the fixed full-points target. The points value now sets the
+book-half distance only; the runner trails open-ended.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ class LegConfig:
     entry_pct: float = 0.05        # +5% above trigger HA high
     sl_buffer: float = 5.0         # points subtracted from red HA low
     trail_step: float = 5.0        # points per trail step
-    target_points: float = 30.0    # FULL target in premium points
+    book_half_points: float = 20.0 # points above entry to book half (then open trail)
 
     @property
     def total_qty(self) -> int:
@@ -93,7 +94,6 @@ class LegStrategy:
     stop_loss: Optional[float] = None
     entry_price: Optional[float] = None
     book_half_level: Optional[float] = None
-    full_target: Optional[float] = None
     peak: float = field(default=0.0)
     half_booked: bool = False
 
@@ -104,7 +104,6 @@ class LegStrategy:
         self.stop_loss = None
         self.entry_price = None
         self.book_half_level = None
-        self.full_target = None
         self.peak = 0.0
         self.half_booked = False
 
@@ -191,15 +190,14 @@ class LegStrategy:
                     return actions
                 self.entry_price = self.entry_level
                 self.peak = ltp
-                self.book_half_level = round(self.entry_price + self.cfg.target_points / 2.0, 2)
-                self.full_target = round(self.entry_price + self.cfg.target_points, 2)
+                self.book_half_level = round(self.entry_price + self.cfg.book_half_points, 2)
                 self.trades_taken += 1
                 self.state = State.IN_FULL
                 actions.append(Action(ActionType.ENTER, self.entry_price,
                                        self.cfg.total_qty,
                                        f"Entry @ {self.entry_price:.2f} | SL {self.stop_loss:.2f} "
                                        f"| book-half {self.book_half_level:.2f} "
-                                       f"| target {self.full_target:.2f}"))
+                                       f"| runner trails open-ended"))
             return actions
 
         # ---- IN_FULL: SL / book-half (then fall through to runner) ----
@@ -214,7 +212,8 @@ class LegStrategy:
             if ltp >= self.book_half_level:
                 actions.append(Action(ActionType.BOOK_HALF, self.book_half_level,
                                        self.cfg.half_qty,
-                                       f"Book half @ {self.book_half_level:.2f} (target/2)"))
+                                       f"Book half @ {self.book_half_level:.2f} "
+                                       f"(entry + {self.cfg.book_half_points:g})"))
                 self.half_booked = True
                 self.stop_loss = self.entry_price          # SL -> breakeven
                 actions.append(Action(ActionType.MODIFY_SL, self.stop_loss,
@@ -224,7 +223,7 @@ class LegStrategy:
             else:
                 return actions
 
-        # ---- IN_RUNNER: target / SL / trail on remaining half ----
+        # ---- IN_RUNNER: open-ended trail on remaining half (no target) ----
         if self.state == State.IN_RUNNER:
             self.peak = max(self.peak, ltp)
 
@@ -235,14 +234,9 @@ class LegStrategy:
                 self._close_trade()
                 return actions
 
-            if ltp >= self.full_target:
-                actions.append(Action(ActionType.EXIT_ALL, self.full_target,
-                                       self.cfg.half_qty,
-                                       f"Target hit @ {self.full_target:.2f}"))
-                self._close_trade()
-                return actions
-
-            # trail: steps measured FROM the book-half level
+            # trail (open-ended): steps measured FROM the book-half level.
+            # At book-half level SL=breakeven; +trail_step beyond -> SL up
+            # trail_step from breakeven, with no upper cap / no target exit.
             if self.peak > self.book_half_level:
                 steps = math.floor((self.peak - self.book_half_level) / self.cfg.trail_step)
                 if steps >= 1:
@@ -267,13 +261,13 @@ if __name__ == "__main__":
                 "ha_green": c >= o, "bb_lower": lo}
 
     cfg = LegConfig(leg="CE", lots=2, lot_size=65, entry_pct=0.05,
-                    sl_buffer=5.0, trail_step=5.0, target_points=40.0)
+                    sl_buffer=5.0, trail_step=5.0, book_half_points=20.0)
     s = LegStrategy(cfg)
 
     # 1) red HA closes below band, low=170.55 -> alert
     for a in s.process_candle(candle(180, 182, 170.55, 172, lo=208)):
         print("candle:", a.reason)
-    # 2) green HA candle (any) -> trigger. entry=188.10*1.05=197.51, SL=170.55-5=165.55
+    # 2) green HA candle (any) -> trigger. entry=188.10*1.05=197.50, SL=170.55-5=165.55
     for a in s.process_candle(candle(185, 188.10, 184, 187, lo=208)):
         print("candle:", a.reason)
     print("state:", s.state.value, "| entry_level:", s.entry_level, "| SL:", s.stop_loss)
@@ -283,14 +277,15 @@ if __name__ == "__main__":
         for a in s.process_tick(p, entries_blocked=False):
             print(f"  tick {p:7.2f} -> {a.type.value:9s} px={a.price:7.2f} q={a.qty:4d}  {a.reason}")
 
-    print("\n-- tick stream --")
+    print("\n-- tick stream (open-ended runner) --")
     tick(195.00)     # below entry, nothing
-    tick(197.60)     # >= entry 197.51 -> ENTER 260 @197.51; book-half=217.51 target=237.51
+    tick(197.60)     # >= entry 197.50 -> ENTER 260; book-half = 197.50+20 = 217.50
     tick(210.00)     # rising, below book-half
-    tick(217.60)     # >= book-half -> BOOK_HALF 130 @217.51, SL->breakeven 197.51
-    tick(223.00)     # peak 223; steps=floor((223-217.51)/5)=1 -> trail SL=197.51+5=202.51
-    tick(229.00)     # peak 229; steps=floor((229-217.51)/5)=2 -> trail SL=207.51
-    tick(238.00)     # >= target 237.51 -> EXIT remaining 130 @237.51
+    tick(217.60)     # >= book-half -> BOOK_HALF 130 @217.50, SL->breakeven 197.50
+    tick(223.00)     # peak 223; steps=floor((223-217.50)/5)=1 -> trail SL=197.50+5=202.50
+    tick(229.00)     # peak 229; steps=floor((229-217.50)/5)=2 -> trail SL=207.50
+    tick(260.00)     # runs far (no target cap); steps=floor((260-217.50)/5)=8 -> SL=237.50
+    tick(236.00)     # pulls back to 236 -> hits trailed SL 237.50? 236<=237.50 -> EXIT remaining
     print("\nfinal state:", s.state.value, "| trades_taken:", s.trades_taken)
     assert s.state == State.IDLE and s.trades_taken == 1
-    print("Tick-based strategy self-test passed.")
+    print("Open-ended-trail strategy self-test passed.")

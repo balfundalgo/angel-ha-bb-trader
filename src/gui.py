@@ -125,7 +125,7 @@ class App(ctk.CTk):
         self.e_entry = self._field(strat, "Entry % above high", st["entry_pct"] * 100)
         self.e_slbuf = self._field(strat, "SL buffer (pts)", st["sl_buffer"])
         self.e_trail = self._field(strat, "Trail step (pts)", st["trail_step"])
-        self.e_target = self._field(strat, "Target (points)", st["target_points"])
+        self.e_target = self._field(strat, "Book-half dist (pts)", st["book_half_points"])
         self.e_max = self._field(strat, "Max trades", st["max_trades"])
 
         btns = ctk.CTkFrame(footer, fg_color="transparent")
@@ -199,7 +199,7 @@ class App(ctk.CTk):
         s["entry_pct"] = float(self.e_entry.get()) / 100.0
         s["sl_buffer"] = float(self.e_slbuf.get())
         s["trail_step"] = float(self.e_trail.get())
-        s["target_points"] = float(self.e_target.get())
+        s["book_half_points"] = float(self.e_target.get())
         s["max_trades"] = int(self.e_max.get())
 
     def _save_settings(self):
@@ -242,7 +242,7 @@ class App(ctk.CTk):
         for leg, info in st.get("legs", {}).items():
             lines.append(
                 f"  {leg}: {info['state']:11s} {info['symbol']}  "
-                f"entry={info['entry']} SL={info['sl']} Tgt={info['target']} "
+                f"entry={info['entry']} SL={info['sl']} BookHalf={info['book_half']} "
                 f"trades={info['trades']}")
         self.lbl_status.configure(text="\n".join(lines))
 

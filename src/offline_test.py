@@ -30,7 +30,7 @@ CONFIG = {
     "bb_period": 20, "bb_mult": 2.0,
     "lots": 1, "lot_size": 65,
     "entry_pct": 0.05, "sl_buffer": 5.0,
-    "trail_step": 5.0, "target_points": 40.0,
+    "trail_step": 5.0, "book_half_points": 20.0,
     "max_trades": 4,
 }
 
@@ -62,15 +62,15 @@ def run(df: pd.DataFrame):
     ha = add_ha_bollinger(df, CONFIG["bb_period"], CONFIG["bb_mult"])
     cfg = LegConfig(leg="TEST", lots=CONFIG["lots"], lot_size=CONFIG["lot_size"],
                     entry_pct=CONFIG["entry_pct"], sl_buffer=CONFIG["sl_buffer"],
-                    trail_step=CONFIG["trail_step"], target_points=CONFIG["target_points"])
+                    trail_step=CONFIG["trail_step"], book_half_points=CONFIG["book_half_points"])
     s = LegStrategy(cfg)
     realized = 0.0
     entry_px = None
 
     print("=" * 90)
     print(f"qty/trade = {cfg.total_qty} (half {cfg.half_qty}) | entry +{cfg.entry_pct*100:g}% "
-          f"| SL buf {cfg.sl_buffer} | target {cfg.target_points}pts "
-          f"(book half at {cfg.target_points/2:g}) | trail {cfg.trail_step}")
+          f"| SL buf {cfg.sl_buffer} | book-half +{cfg.book_half_points:g}pts "
+          f"(book half at entry+{cfg.book_half_points:g}, open trail) | trail {cfg.trail_step}")
     print("Execution replays intra-candle ticks: open -> high -> low -> close")
     print("=" * 90)
 

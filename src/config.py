@@ -28,7 +28,7 @@ TRADING_MODE = "PAPER"
 
 # Version stamp (shown in the GUI title + logged at startup so you can tell
 # which build is actually running).
-APP_VERSION = "1.5.1-ticktrade"
+APP_VERSION = "1.6.0-openrunner"
 
 # ----------------------------------------------------------------------
 # Index specifications
@@ -93,7 +93,7 @@ STRATEGY = {
     "entry_pct": 0.05,          # 5% above trigger high
     "sl_buffer": 5.0,           # points
     "trail_step": 5.0,          # points
-    "target_points": 30.0,      # FULL target in premium points (book half at half)
+    "book_half_points": 20.0,   # points above entry to book half (runner trails open-ended)
 
     "max_trades": 4,            # total entries per day (CE + PE combined)
 

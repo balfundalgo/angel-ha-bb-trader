@@ -99,15 +99,15 @@ class TradingEngine:
                 cfg = LegConfig(
                     leg=leg, lots=s["lots"], lot_size=inst[leg]["lotsize"],
                     entry_pct=s["entry_pct"], sl_buffer=s["sl_buffer"],
-                    trail_step=s["trail_step"], target_points=s["target_points"],
+                    trail_step=s["trail_step"], book_half_points=s["book_half_points"],
                 )
                 self.legs[leg] = LegStrategy(cfg)
                 self.locks[leg] = threading.Lock()
                 self.last_dt[leg] = None
                 logger.info(f"{leg}: {cfg.lots} lot(s) x2 x {cfg.lot_size} = "
                             f"{cfg.total_qty} qty (half {cfg.half_qty}); "
-                            f"target {cfg.target_points}pts, book-half at "
-                            f"{cfg.target_points/2:.0f}pts")
+                            f"book-half at entry+{cfg.book_half_points:g}pts, "
+                            f"then open-ended trail ({cfg.trail_step:g}pt steps)")
 
                 # one-time historical fetch to SEED the BB warmup
                 builder = CandleBuilder(s["timeframe"], s["start_time"])
@@ -292,7 +292,7 @@ class TradingEngine:
                 "symbol": self.instruments[leg]["symbol"],
                 "sl": strat.stop_loss,
                 "entry": strat.entry_price,
-                "target": strat.full_target,
+                "book_half": strat.book_half_level,
                 "trades": strat.trades_taken,
             }
         self.status_cb({
@@ -332,7 +332,7 @@ class TradingEngine:
                 "ltp": ltp,
                 "qty": qty,
                 "sl": strat.stop_loss,
-                "target": strat.full_target,
+                "book_half": strat.book_half_level,
                 "unrealized": unreal,
             })
         return {
