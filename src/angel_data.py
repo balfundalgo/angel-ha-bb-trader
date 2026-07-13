@@ -202,6 +202,42 @@ def resolve_atm_instruments(index: str, spot: float) -> dict:
 # ======================================================================
 _ANGEL_COLS = ["datetime", "open", "high", "low", "close", "volume"]
 
+# NSE/BSE session length in minutes (09:15 -> 15:30)
+SESSION_MINUTES = 375
+# Extra weekdays of padding so public holidays inside the window can't starve
+# the seed (a holiday looks like a weekday but has no candles).
+HOLIDAY_PAD_DAYS = 4
+
+# Angel caps how many days one getCandleData request may span, per interval.
+# Stay under these so a wide request isn't rejected outright.
+MAX_DAYS_PER_INTERVAL = {
+    "ONE_MINUTE": 30, "THREE_MINUTE": 60, "FIVE_MINUTE": 100,
+    "TEN_MINUTE": 100, "FIFTEEN_MINUTE": 200, "THIRTY_MINUTE": 200,
+    "ONE_HOUR": 400, "ONE_DAY": 2000,
+}
+
+
+def _trading_days_back(now: datetime, sessions: int) -> datetime:
+    """
+    Walk back `sessions` WEEKDAYS from `now` and return that day's 09:15.
+
+    If we're called before the market opens (e.g. the 09:08 pre-open snapshot),
+    today can contribute no candles, so today is not counted as a session.
+    """
+    d = now.date()
+    market_open_today = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now < market_open_today:
+        d -= timedelta(days=1)          # today has no data yet
+
+    counted = 0
+    while counted < sessions:
+        if d.weekday() < 5:             # Mon-Fri
+            counted += 1
+        d -= timedelta(days=1)
+    # step forward one (loop decrements past the last counted day)
+    d += timedelta(days=1)
+    return datetime(d.year, d.month, d.day, 9, 15)
+
 
 def _fetch_native(token: str, exchange: str, interval: str,
                   from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
@@ -300,13 +336,30 @@ def get_option_candles(token: str, exchange: str, timeframe: int,
         raise ValueError(f"Unsupported timeframe: {timeframe}")
 
     now = datetime.now()
-    # lookback in calendar terms: candles * minutes, plus slack for off-hours
+    # Lookback must be counted in TRADING days, not calendar days. A naive
+    # calendar lookback lands on the weekend every Monday (and after every
+    # holiday), so the window contains no session and Angel returns [] --
+    # which looked like "no history exists" but was really "we asked for a
+    # weekend". Session = 09:15-15:30 = 375 minutes.
     minutes_needed = lookback_candles * timeframe
-    days_back = max(1, math.ceil(minutes_needed / (60 * 6)) + 1)
-    from_dt = (now - timedelta(days=days_back)).replace(
-        hour=9, minute=15, second=0, microsecond=0)
+    sessions_needed = max(1, math.ceil(minutes_needed / SESSION_MINUTES))
+    from_dt = _trading_days_back(now, sessions_needed + HOLIDAY_PAD_DAYS)
 
     if angel == "RESAMPLE_4H":
         base = _fetch_native(token, exchange, "ONE_HOUR", from_dt, now)
         return _resample(base, 240)
-    return _fetch_native(token, exchange, angel, from_dt, now)
+
+    # clamp the span to Angel's documented per-interval maximum
+    cap = MAX_DAYS_PER_INTERVAL.get(angel)
+    if cap and (now - from_dt).days > cap:
+        from_dt = now - timedelta(days=cap)
+
+    df = _fetch_native(token, exchange, angel, from_dt, now)
+    logger.info(f"Candles {exchange}:{token} {angel} "
+                f"{from_dt:%a %d-%b %H:%M} -> {now:%a %d-%b %H:%M} "
+                f"= {len(df)} rows")
+    if df.empty:
+        logger.warning(f"Angel returned NO candles for {exchange}:{token} in "
+                       f"that window (contract may be newly listed / illiquid, "
+                       f"or the window covered no trading session).")
+    return df
