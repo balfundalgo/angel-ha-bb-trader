@@ -13,6 +13,7 @@ enforced here.
 
 from __future__ import annotations
 import threading
+import traceback
 import time
 from datetime import datetime
 
@@ -129,6 +130,12 @@ class TradingEngine:
             # start the live feed (no more getCandleData after this)
             self.feed.start()
 
+            # Broker reconciler: auto-correct app state if the broker closes a
+            # position the app still thinks is open (e.g. an exchange SL fires
+            # while the feed is starved). LIVE only; strategy logic untouched.
+            if config.TRADING_MODE == "LIVE":
+                threading.Thread(target=self._reconcile_loop, daemon=True).start()
+
             # 3) wait for start time, then candle loop
             self._wait_until(s["start_time"])
             self._candle_loop()
@@ -170,6 +177,101 @@ class TradingEngine:
         s = config.STRATEGY
         combined = sum(l.trades_taken for l in self.legs.values())
         return combined >= s["max_trades"] or self._past(s["stop_entry_time"])
+
+    # ---------------- broker reconciler (read-only auto-correct) ----------
+    def _reconcile_loop(self):
+        interval = getattr(config, "RECONCILE_INTERVAL", 20)
+        while not self._stop.is_set():
+            # sleep first so positions have time to exist after entry
+            for _ in range(int(interval)):
+                if self._stop.is_set():
+                    return
+                time.sleep(1)
+            try:
+                self._reconcile_once()
+            except Exception as e:
+                logger.error(f"Reconciler cycle error: {e}")
+
+    def _reconcile_once(self):
+        book = self.om.fetch_order_book()          # 1 API call
+        positions = self.om.fetch_positions()      # 1 API call (best-effort)
+
+        for leg, strat in self.legs.items():
+            inst = self.instruments.get(leg)
+            if not inst:
+                continue
+            sym = inst["symbol"]
+            app_open = strat.state in (State.IN_FULL, State.IN_RUNNER)
+            held = (strat.cfg.total_qty if strat.state == State.IN_FULL
+                    else strat.cfg.half_qty if strat.state == State.IN_RUNNER
+                    else 0)
+
+            # Determine whether the broker is FLAT on this symbol.
+            if positions is not None:
+                broker_qty = positions.get(sym, 0)
+                broker_flat = (broker_qty == 0)
+            else:
+                # fallback: tracked SL order shows COMPLETE (it triggered)
+                sl_id = self.om.sl_orders.get(sym)
+                row = book.get(str(sl_id)) if sl_id else None
+                broker_flat = bool(row and str(row.get("status", "")).lower()
+                                   in ("complete", "filled"))
+                broker_qty = 0 if broker_flat else held
+
+            # CASE 1: app thinks OPEN but broker is FLAT -> auto-correct to flat
+            if app_open and broker_flat:
+                lock = self.locks.get(leg)
+                if lock is None or not lock.acquire(timeout=5):
+                    continue
+                try:
+                    if strat.state not in (State.IN_FULL, State.IN_RUNNER):
+                        continue  # changed while we waited
+                    exit_px = self._reconcile_exit_price(sym, book)
+                    entry_px = self.entry_px.get(leg, exit_px)
+                    logger.critical(f"RECONCILE: broker FLAT but app holds {held} "
+                                    f"{sym}. Correcting app state.")
+                    self.om.reconcile_close(inst, held, exit_px, entry_px,
+                                            "auto-reconcile (broker closed it)")
+                    self.entry_px.pop(leg, None)
+                    strat._close_trade()
+                    self._push_status()
+                finally:
+                    lock.release()
+
+            # CASE 2: app thinks FLAT but broker HOLDS -> alert only (no auto-trade)
+            elif (not app_open) and positions is not None and broker_qty != 0:
+                logger.critical(f"RECONCILE ALERT: broker shows {broker_qty} open "
+                                f"{sym} but app is flat. CHECK TERMINAL — possible "
+                                f"orphaned position (an exit may have been rejected).")
+
+    def _reconcile_exit_price(self, sym, book):
+        """Best exit price for a broker-closed position: the triggered SL's
+        fill, else the latest completed SELL on the symbol, else last tick."""
+        # tracked SL fill
+        sl_id = self.om.sl_orders.get(sym)
+        row = book.get(str(sl_id)) if sl_id else None
+        if row and str(row.get("status", "")).lower() in ("complete", "filled"):
+            px = float(row.get("averageprice") or row.get("price") or 0) or 0.0
+            if px:
+                return px
+        # latest completed SELL on this symbol
+        best = None
+        for r in book.values():
+            if (str(r.get("tradingsymbol")) == sym
+                    and str(r.get("transactiontype")).upper() == "SELL"
+                    and str(r.get("status", "")).lower() in ("complete", "filled")):
+                px = float(r.get("averageprice") or r.get("price") or 0) or 0.0
+                if px:
+                    best = px
+        if best:
+            return best
+        # last resort: last websocket tick
+        for lg, i in self.instruments.items():
+            if i["symbol"] == sym:
+                lp = self.builders[lg].last_price
+                if lp:
+                    return lp
+        return 0.0
 
     # ---------------- candle loop ----------------
     def _candle_loop(self):
@@ -220,7 +322,8 @@ class TradingEngine:
                         actions = strat.process_candle(row)
                         self._execute(leg, actions)
                 except Exception as e:
-                    logger.error(f"[{leg}] cycle error (continuing): {e}")
+                    logger.error(f"[{leg}] cycle error (continuing): {e}\n"
+                                 f"{traceback.format_exc()}")
 
             self._push_status()
 

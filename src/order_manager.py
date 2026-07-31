@@ -225,6 +225,71 @@ class OrderManager:
                        f"id={order_id} — verify in terminal")
         return False
 
+    def fetch_order_book(self):
+        """Return {orderid: row} from Angel, or {} on failure. One API call."""
+        try:
+            api_rate_limiter.wait("orderBook")
+            book = config.SMART.orderBook()
+            out = {}
+            for row in (book or {}).get("data", []) or []:
+                oid = str(row.get("orderid"))
+                out[oid] = row
+            return out
+        except Exception as e:
+            logger.error(f"orderBook fetch failed: {e}")
+            return {}
+
+    def fetch_positions(self):
+        """Return {symbol: netqty} from Angel (best-effort across SDK method
+        names), or None if positions can't be read."""
+        for meth in ("position", "getPosition", "positionData"):
+            fn = getattr(config.SMART, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                api_rate_limiter.wait("position")
+                resp = fn()
+                data = (resp or {}).get("data") or []
+                out = {}
+                for row in data:
+                    sym = str(row.get("tradingsymbol") or row.get("symbolname") or "")
+                    try:
+                        net = int(float(row.get("netqty", 0) or 0))
+                    except (TypeError, ValueError):
+                        net = 0
+                    if sym:
+                        out[sym] = net
+                return out
+            except Exception as e:
+                logger.error(f"positions fetch via {meth} failed: {e}")
+                return None
+        return None
+
+    def order_fill(self, order_id):
+        """Return (status_lower, avg_price) for an order from the order book."""
+        book = self.fetch_order_book()
+        row = book.get(str(order_id))
+        if not row:
+            return None, 0.0
+        status = str(row.get("status", "")).lower()
+        try:
+            avg = float(row.get("averageprice") or row.get("price") or 0) or 0.0
+        except (TypeError, ValueError):
+            avg = 0.0
+        return status, avg
+
+    def reconcile_close(self, inst, qty, exit_price, entry_price, reason):
+        """Record an exit the BROKER already executed (no order is placed).
+        Cancels any lingering resting SL so it can't later open a short."""
+        self._cancel_protective_sl(inst)          # kill any naked resting SL
+        pnl = (exit_price - entry_price) * qty
+        self.realized += pnl
+        self._record(inst.get("leg", "?"), inst["symbol"], "SELL", qty,
+                     exit_price, reason, pnl)
+        logger.critical(f"RECONCILED {inst['symbol']}: broker closed {qty} @ "
+                        f"{exit_price:.2f} (app had it open). P&L {pnl:+.2f} "
+                        f"corrected. [{reason}]")
+
     def summary(self):
         return {"realized_pnl": round(self.realized, 2),
                 "fills": len(self.ledger)}

@@ -28,7 +28,7 @@ TRADING_MODE = "PAPER"
 
 # Version stamp (shown in the GUI title + logged at startup so you can tell
 # which build is actually running).
-APP_VERSION = "1.6.2-livefix"
+APP_VERSION = "1.7.0-reconcile"
 
 # ----------------------------------------------------------------------
 # Index specifications
@@ -110,6 +110,10 @@ PAPER = {
 }
 
 RETRY = {"max_retries": 3, "retry_delay": 1, "base_delay": 1}
+
+# Broker reconciler poll interval (seconds). One order-book + one positions
+# call per cycle; both are throttled to ~1/sec, so 20s is very safe.
+RECONCILE_INTERVAL = 20
 
 # ----------------------------------------------------------------------
 # Paths
