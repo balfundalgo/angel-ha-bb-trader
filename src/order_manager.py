@@ -66,18 +66,21 @@ class OrderManager:
 
     def sell(self, inst: dict, qty: int, ref_price: float, reason: str,
              entry_price: float) -> float:
-        px = self._fill_price(ref_price, side="SELL")
         if config.TRADING_MODE == "LIVE":
-            # CRITICAL: cancel the resting protective SL BEFORE any market sell,
-            # so total sell qty can never exceed the position (the cause of the
-            # mass rejections). Then verify the exit actually filled.
+            # cancel the resting SL first so this reducing sell nets cleanly
             self._cancel_protective_sl(inst)
             oid = self._live_market(inst, qty, "SELL")
             ok = self._verify_or_warn(oid, f"SELL {qty} {inst['symbol']} ({reason})")
             if not ok:
-                logger.critical(f"!!! EXIT MAY HAVE FAILED for {inst['symbol']} "
-                                f"({reason}). CHECK THE TERMINAL — position may "
-                                f"still be OPEN. !!!")
+                # DO NOT record a phantom exit. Keep books honest; the position
+                # is still open at the broker and the reconciler will handle it.
+                logger.critical(f"!!! EXIT REJECTED for {inst['symbol']} "
+                                f"({reason}) — NOT recorded. Position still OPEN; "
+                                f"reconciler/exchange-SL will resolve. !!!")
+                return None
+            px = self._fill_price(ref_price, side="SELL")
+        else:
+            px = self._fill_price(ref_price, side="SELL")
         pnl = (px - entry_price) * qty
         self.realized += pnl
         self._record(inst.get("leg", "?"), inst["symbol"], "SELL", qty, px,
@@ -267,16 +270,26 @@ class OrderManager:
 
     def order_fill(self, order_id):
         """Return (status_lower, avg_price) for an order from the order book."""
-        book = self.fetch_order_book()
+        status, avg, _ = self.order_fill_detail(order_id)
+        return status, avg
+
+    def order_fill_detail(self, order_id, book=None):
+        """Return (status_lower, avg_price, filled_qty) for an order."""
+        if book is None:
+            book = self.fetch_order_book()
         row = book.get(str(order_id))
         if not row:
-            return None, 0.0
+            return None, 0.0, 0
         status = str(row.get("status", "")).lower()
         try:
             avg = float(row.get("averageprice") or row.get("price") or 0) or 0.0
         except (TypeError, ValueError):
             avg = 0.0
-        return status, avg
+        try:
+            fq = int(float(row.get("filledshares") or row.get("quantity") or 0) or 0)
+        except (TypeError, ValueError):
+            fq = 0
+        return status, avg, fq
 
     def reconcile_close(self, inst, qty, exit_price, entry_price, reason):
         """Record an exit the BROKER already executed (no order is placed).

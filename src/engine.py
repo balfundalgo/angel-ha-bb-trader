@@ -40,6 +40,7 @@ class TradingEngine:
         self.instruments = {}          # 'CE'/'PE' -> instrument dict
         self.last_dt = {}              # 'CE'/'PE' -> last processed candle dt
         self.entry_px = {}             # 'CE'/'PE' -> current entry price
+        self.open_qty = {}             # 'CE'/'PE' -> qty the ENGINE believes open
         self.builders = {}             # 'CE'/'PE' -> CandleBuilder
         self.token_to_leg = {}         # token -> 'CE'/'PE'
         self.locks = {}                # 'CE'/'PE' -> threading.Lock (candle vs tick)
@@ -201,48 +202,71 @@ class TradingEngine:
             if not inst:
                 continue
             sym = inst["symbol"]
-            app_open = strat.state in (State.IN_FULL, State.IN_RUNNER)
-            held = (strat.cfg.total_qty if strat.state == State.IN_FULL
-                    else strat.cfg.half_qty if strat.state == State.IN_RUNNER
-                    else 0)
+            app_qty = self.open_qty.get(leg, 0)     # what the ENGINE believes open
+            sl_id = self.om.sl_orders.get(sym)
 
-            # Determine whether the broker is FLAT on this symbol.
-            if positions is not None:
-                broker_qty = positions.get(sym, 0)
-                broker_flat = (broker_qty == 0)
-            else:
-                # fallback: tracked SL order shows COMPLETE (it triggered)
-                sl_id = self.om.sl_orders.get(sym)
-                row = book.get(str(sl_id)) if sl_id else None
-                broker_flat = bool(row and str(row.get("status", "")).lower()
-                                   in ("complete", "filled"))
-                broker_qty = 0 if broker_flat else held
-
-            # CASE 1: app thinks OPEN but broker is FLAT -> auto-correct to flat
-            if app_open and broker_flat:
-                lock = self.locks.get(leg)
-                if lock is None or not lock.acquire(timeout=5):
+            # (1) Did the resting exchange SL TRIGGER and fill? That is our
+            #     stop exit. Record it and flatten the app's view.
+            if sl_id:
+                status, avg, fq = self.om.order_fill_detail(sl_id, book)
+                if status in ("complete", "filled"):
+                    lock = self.locks.get(leg)
+                    if lock and lock.acquire(timeout=5):
+                        try:
+                            qty = fq or app_qty or strat.cfg.total_qty
+                            entry_px = self.entry_px.get(leg, avg)
+                            self.om.sl_orders.pop(sym, None)   # it's done
+                            self.om.reconcile_close(inst, qty, avg or entry_px,
+                                                    entry_px,
+                                                    "exchange SL triggered")
+                            self.open_qty[leg] = 0
+                            self.entry_px.pop(leg, None)
+                            if strat.state in (State.IN_FULL, State.IN_RUNNER):
+                                strat._close_trade()
+                            self._push_status()
+                        finally:
+                            lock.release()
                     continue
-                try:
-                    if strat.state not in (State.IN_FULL, State.IN_RUNNER):
-                        continue  # changed while we waited
-                    exit_px = self._reconcile_exit_price(sym, book)
-                    entry_px = self.entry_px.get(leg, exit_px)
-                    logger.critical(f"RECONCILE: broker FLAT but app holds {held} "
-                                    f"{sym}. Correcting app state.")
-                    self.om.reconcile_close(inst, held, exit_px, entry_px,
-                                            "auto-reconcile (broker closed it)")
-                    self.entry_px.pop(leg, None)
-                    strat._close_trade()
-                    self._push_status()
-                finally:
-                    lock.release()
 
-            # CASE 2: app thinks FLAT but broker HOLDS -> alert only (no auto-trade)
-            elif (not app_open) and positions is not None and broker_qty != 0:
-                logger.critical(f"RECONCILE ALERT: broker shows {broker_qty} open "
-                                f"{sym} but app is flat. CHECK TERMINAL — possible "
-                                f"orphaned position (an exit may have been rejected).")
+            # Determine broker net qty on this symbol (best-effort).
+            broker_qty = positions.get(sym) if positions is not None else None
+
+            # (2) App believes OPEN but broker is FLAT (closed elsewhere:
+            #     manual square-off, or an SL we lost track of) -> book it.
+            if app_qty > 0 and broker_qty == 0:
+                lock = self.locks.get(leg)
+                if lock and lock.acquire(timeout=5):
+                    try:
+                        exit_px = self._reconcile_exit_price(sym, book)
+                        entry_px = self.entry_px.get(leg, exit_px)
+                        self.om.reconcile_close(inst, app_qty, exit_px, entry_px,
+                                                "auto-reconcile (broker flat)")
+                        self.open_qty[leg] = 0
+                        self.entry_px.pop(leg, None)
+                        if strat.state in (State.IN_FULL, State.IN_RUNNER):
+                            strat._close_trade()
+                        self._push_status()
+                    finally:
+                        lock.release()
+                continue
+
+            # (3) App believes FLAT but broker HOLDS -> orphan. Try to protect
+            #     it with a fresh closing SL (nets cleanly, no short margin),
+            #     and alert loudly. We do NOT fire a naked market sell (that is
+            #     what Angel rejects for margin).
+            if app_qty == 0 and broker_qty and broker_qty > 0:
+                if not sl_id:
+                    logger.critical(f"ORPHAN: broker holds {broker_qty} {sym} with "
+                                    f"NO resting SL. Placing a protective SL and "
+                                    f"alerting — CHECK TERMINAL.")
+                    # re-protect the orphan with a closing stop a bit below LTP
+                    lp = self._reconcile_exit_price(sym, book)
+                    if lp:
+                        self.om.place_protective_sl(inst, broker_qty,
+                                                    round(lp * 0.98, 2))
+                else:
+                    logger.critical(f"ORPHAN: broker holds {broker_qty} {sym} "
+                                    f"(a protective SL is resting). CHECK TERMINAL.")
 
     def _reconcile_exit_price(self, sym, book):
         """Best exit price for a broker-closed position: the triggered SL's
@@ -335,16 +359,27 @@ class TradingEngine:
             if a.type == ActionType.ENTER:
                 px = self.om.buy(inst, a.qty, a.price, a.reason)
                 self.entry_px[leg] = px
+                self.open_qty[leg] = a.qty          # engine believes this open
                 self.om.place_protective_sl(inst, a.qty, strat.stop_loss)
             elif a.type == ActionType.BOOK_HALF:
-                self.om.sell(inst, a.qty, a.price, a.reason,
-                             self.entry_px.get(leg, a.price))
+                # partial PROFIT exit (sell half, stay long half) = reducing order.
+                px = self.om.sell(inst, a.qty, a.price, a.reason,
+                                  self.entry_px.get(leg, a.price))
+                if px is not None:                  # only reduce if it filled
+                    self.open_qty[leg] = max(0, self.open_qty.get(leg, a.qty * 2) - a.qty)
             elif a.type == ActionType.MODIFY_SL:
+                # move the single resting exchange SL up the trail
                 self.om.place_protective_sl(inst, a.qty, a.price)
             elif a.type == ActionType.EXIT_ALL:
-                self.om.sell(inst, a.qty, a.price, a.reason,
-                             self.entry_px.get(leg, a.price))
-                self.entry_px.pop(leg, None)
+                # Every strategy-driven full exit is a STOP hit (initial /
+                # breakeven / trailing). We DO NOT fire a naked market sell for
+                # it — that is what Angel priced as a fresh short (~2L margin)
+                # and rejected. Instead we let the RESTING exchange SL trigger:
+                # it already sits at this level and is recognised as a closing
+                # order. The reconciler records the fill when it triggers.
+                logger.info(f"[{leg}] stop exit -> delegated to resting exchange "
+                            f"SL ({a.reason}); awaiting exchange fill")
+                # keep entry_px[leg] until the reconciler books the real fill
             elif a.type == ActionType.CANCEL:
                 logger.info(f"[{leg}] {a.reason}")
             elif a.type == ActionType.INFO:
@@ -353,12 +388,22 @@ class TradingEngine:
     def _square_off_all(self, reason):
         for leg, strat in self.legs.items():
             with self.locks[leg]:
+                qty = self.open_qty.get(leg, 0)
+                if qty <= 0:
+                    continue
+                inst = self.instruments[leg]
+                last = self.builders[leg].last_price or self.entry_px.get(leg, 0.0)
+                sym = inst["symbol"]
+                if self.om.sl_orders.get(sym) and last:
+                    # flatten by making the resting SL trigger now (closing stop,
+                    # nets cleanly — avoids the naked-market-sell short margin)
+                    self.om.place_protective_sl(inst, qty, round(last * 0.999, 2))
+                    logger.info(f"[{leg}] square-off: resting SL pulled to market "
+                                f"to flatten {qty} {sym}")
+                else:
+                    self.om.sell(inst, qty, last, reason, self.entry_px.get(leg, last))
+                # engine view / strategy view left for the reconciler to confirm
                 if strat.state in (State.IN_FULL, State.IN_RUNNER):
-                    qty = (strat.cfg.half_qty if strat.state == State.IN_RUNNER
-                           else strat.cfg.total_qty)
-                    inst = self.instruments[leg]
-                    px = self.builders[leg].last_price or self.entry_px.get(leg, 0.0)
-                    self.om.sell(inst, qty, px, reason, self.entry_px.get(leg, px))
                     strat._close_trade()
 
     # ---------------- timing helpers ----------------

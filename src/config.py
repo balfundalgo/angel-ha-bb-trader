@@ -28,7 +28,7 @@ TRADING_MODE = "PAPER"
 
 # Version stamp (shown in the GUI title + logged at startup so you can tell
 # which build is actually running).
-APP_VERSION = "1.7.0-reconcile"
+APP_VERSION = "1.8.0-slexit"
 
 # ----------------------------------------------------------------------
 # Index specifications
