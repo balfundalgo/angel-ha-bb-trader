@@ -395,11 +395,12 @@ class TradingEngine:
                 last = self.builders[leg].last_price or self.entry_px.get(leg, 0.0)
                 sym = inst["symbol"]
                 if self.om.sl_orders.get(sym) and last:
-                    # flatten by making the resting SL trigger now (closing stop,
-                    # nets cleanly — avoids the naked-market-sell short margin)
-                    self.om.place_protective_sl(inst, qty, round(last * 0.999, 2))
-                    logger.info(f"[{leg}] square-off: resting SL pulled to market "
-                                f"to flatten {qty} {sym}")
+                    # flatten NOW: pull the SL trigger just ABOVE market so the
+                    # exchange fires it immediately (a sell-stop triggers when
+                    # LTP <= trigger). Below-market would wait for a downtick.
+                    self.om.place_protective_sl(inst, qty, round(last * 1.001, 2))
+                    logger.info(f"[{leg}] square-off: resting SL pulled above market "
+                                f"to flatten {qty} {sym} now")
                 else:
                     self.om.sell(inst, qty, last, reason, self.entry_px.get(leg, last))
                 # engine view / strategy view left for the reconciler to confirm

@@ -134,16 +134,55 @@ class OrderManager:
         try:
             api_rate_limiter.wait("modifyOrder")
             config.SMART.modifyOrder(params)
-            logger.info(f"Modified SL {oid} -> trigger {trigger} qty {qty}")
-            return oid
         except Exception as e:
-            logger.error(f"Modify SL {oid} failed: {e}; replacing instead")
-            # fallback: cancel + place fresh so we never lose protection silently
-            self._cancel_protective_sl(inst)
-            new = self._live_stoploss(inst, qty, trigger)
-            if new:
-                self.sl_orders[inst["symbol"]] = new
-            return new
+            logger.error(f"Modify SL {oid} raised: {e}; cancel-and-replace")
+            return self._replace_stoploss(inst, qty, trigger)
+
+        # VERIFY the modify actually took at the exchange (do not trust that
+        # the SDK call merely returned). Read the order back.
+        if self._verify_sl_trigger(oid, trigger):
+            logger.info(f"Modified SL {oid} -> trigger {trigger} qty {qty} (verified)")
+            return oid
+        logger.warning(f"Modify SL {oid} did NOT take at exchange "
+                       f"(wanted {trigger}); cancel-and-replace")
+        return self._replace_stoploss(inst, qty, trigger)
+
+    def _replace_stoploss(self, inst, qty, trigger):
+        """Cancel the tracked SL and place a fresh one at `trigger`; verify it
+        rests. Guarantees the exchange trigger is where we intend."""
+        self._cancel_protective_sl(inst)
+        oid = self._live_stoploss(inst, qty, trigger)
+        if oid and self._verify_sl_trigger(oid, trigger):
+            self.sl_orders[inst["symbol"]] = oid
+            logger.info(f"Replaced SL -> new id {oid} trigger {trigger} (verified)")
+            return oid
+        if oid:
+            self.sl_orders[inst["symbol"]] = oid
+            logger.critical(f"Replacement SL {oid} placed but NOT verified at "
+                            f"trigger {trigger} — CHECK TERMINAL.")
+        else:
+            logger.critical(f"FAILED to place replacement SL at {trigger} for "
+                            f"{inst['symbol']} — position may be UNPROTECTED.")
+        return oid
+
+    def _verify_sl_trigger(self, oid, want_trigger, tries=3):
+        """Confirm order `oid` is a live resting SL whose exchange trigger
+        matches want_trigger. Returns False if it's gone or mismatched."""
+        for _ in range(tries):
+            book = self.fetch_order_book()
+            row = book.get(str(oid))
+            if row:
+                status = str(row.get("status", "")).lower()
+                if status in ("cancelled", "rejected", "complete", "filled"):
+                    return False
+                try:
+                    got = float(row.get("triggerprice") or 0)
+                except (TypeError, ValueError):
+                    got = 0.0
+                if abs(got - round(float(want_trigger), 2)) < 0.06:
+                    return True
+            time.sleep(0.5)
+        return False
 
     def _live_market(self, inst, qty, side):
         params = {
