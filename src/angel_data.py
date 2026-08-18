@@ -34,23 +34,72 @@ from api_rate_limiter import api_rate_limiter
 # ======================================================================
 # Scrip master
 # ======================================================================
-def download_scrip_master(force=False) -> bool:
-    """Download the public Angel scrip master JSON (no auth needed)."""
+def _cached_scrip_master_ok() -> bool:
+    """True if a previously-saved scrip master exists and parses."""
+    if not os.path.exists(config.SCRIP_MASTER_FILE):
+        return False
     try:
-        if (not force) and os.path.exists(config.SCRIP_MASTER_FILE):
-            age = time.time() - os.path.getmtime(config.SCRIP_MASTER_FILE)
-            if age < 12 * 3600:  # reuse if < 12h old
-                return True
-        logger.info("Downloading Angel scrip master...")
-        r = requests.get(config.SCRIP_MASTER_URL, timeout=60)
-        r.raise_for_status()
-        with open(config.SCRIP_MASTER_FILE, "w", encoding="utf-8") as f:
-            f.write(r.text)
-        logger.info("Scrip master saved.")
+        with open(config.SCRIP_MASTER_FILE, "r", encoding="utf-8") as f:
+            json.load(f)
         return True
-    except Exception as e:
-        logger.error(f"Scrip master download failed: {e}")
-        return os.path.exists(config.SCRIP_MASTER_FILE)
+    except Exception:
+        return False
+
+
+def download_scrip_master(force=False) -> bool:
+    """
+    Download the public Angel scrip master JSON (~35 MB, no auth).
+
+    Robust against the mid-download connection drops seen in the wild:
+      * streams to a temp file (so a partial read never corrupts the cache),
+      * retries a few times with backoff on IncompleteRead / connection errors,
+      * validates the JSON parses before committing,
+      * falls back to the last good cached copy if all retries fail.
+    """
+    # reuse a fresh (<12h) valid cache without re-downloading
+    if (not force) and os.path.exists(config.SCRIP_MASTER_FILE):
+        age = time.time() - os.path.getmtime(config.SCRIP_MASTER_FILE)
+        if age < 12 * 3600 and _cached_scrip_master_ok():
+            logger.info("Using cached scrip master (fresh).")
+            return True
+
+    tmp = config.SCRIP_MASTER_FILE + ".part"
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        try:
+            logger.info(f"Downloading Angel scrip master (attempt {attempt}/{attempts})...")
+            with requests.get(config.SCRIP_MASTER_URL, timeout=120, stream=True) as r:
+                r.raise_for_status()
+                got = 0
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 16):
+                        if chunk:
+                            f.write(chunk)
+                            got += len(chunk)
+            # validate before committing
+            with open(tmp, "r", encoding="utf-8") as f:
+                json.load(f)
+            os.replace(tmp, config.SCRIP_MASTER_FILE)
+            logger.info(f"Scrip master saved ({got/1e6:.1f} MB).")
+            return True
+        except Exception as e:
+            logger.error(f"Scrip master download attempt {attempt} failed: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            if attempt < attempts:
+                time.sleep(min(30, 3 * attempt))
+
+    # all attempts failed -> fall back to last good cached copy if usable
+    if _cached_scrip_master_ok():
+        logger.warning("Download failed; falling back to the last cached scrip "
+                       "master (instrument list barely changes day to day).")
+        return True
+    logger.critical("Scrip master could not be downloaded and no valid cache "
+                    "exists. Check the network and press Start again.")
+    return False
 
 
 def _load_options(index: str) -> pd.DataFrame:

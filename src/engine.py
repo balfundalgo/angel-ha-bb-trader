@@ -59,7 +59,17 @@ class TradingEngine:
 
     def stop(self):
         self._stop.set()
-        logger.info("Stop requested.")
+        logger.info("Stop requested — halting all trade execution.")
+        # Disconnect the feed NOW so no more ticks arrive (execution is
+        # tick-driven; waiting for the candle loop to exit is not enough).
+        try:
+            if self.feed:
+                self.feed.stop()
+        except Exception:
+            pass
+        logger.info("Engine halted. NOTE: any OPEN position stays live at the "
+                    "broker, protected by its resting exchange SL — manage it "
+                    "in the terminal if needed.")
 
     # ---------------- main run ----------------
     def _run(self):
@@ -151,6 +161,8 @@ class TradingEngine:
 
     # ---------------- tick routing (all execution happens here) ----------
     def _on_tick(self, token, ltp, volume, ts):
+        if self._stop.is_set():
+            return                     # stop requested -> no more execution
         leg = self.token_to_leg.get(str(token))
         if not leg or leg not in self.builders:
             return
