@@ -24,6 +24,15 @@ from logger import logger
 from api_rate_limiter import api_rate_limiter
 
 
+# NSE/BSE index options trade on a 5-paise tick. Every price/trigger sent to
+# the exchange MUST be a multiple of 0.05 or it is rejected ("multiples of 5
+# paise"). round(x, 2) is NOT enough — snap to the tick.
+def round_to_tick(price: float, tick: float = 0.05) -> float:
+    if not price:
+        return 0.0
+    return round(round(float(price) / tick) * tick, 2)
+
+
 class OrderManager:
     def __init__(self):
         self.realized = 0.0
@@ -89,15 +98,25 @@ class OrderManager:
 
     def place_protective_sl(self, inst: dict, qty: int, trigger: float):
         """Ensure exactly ONE protective SL per symbol: modify if one exists,
-        otherwise place a new one. Never stacks."""
+        otherwise place a new one and verify it actually rests. Never stacks."""
         if config.TRADING_MODE != "LIVE" or not config.STRATEGY["place_protective_sl"]:
             return None
+        trigger = round_to_tick(trigger)          # tick-align up front
         sym = inst["symbol"]
         if self.sl_orders.get(sym):
             return self._modify_stoploss(inst, qty, trigger, self.sl_orders[sym])
         oid = self._live_stoploss(inst, qty, trigger)
-        if oid:
+        if oid and self._verify_sl_trigger(oid, trigger):
             self.sl_orders[sym] = oid
+            logger.info(f"Protective SL {oid} resting @ {trigger} (verified)")
+        elif oid:
+            # placed but not resting (e.g. rejected) — do NOT treat a dead order
+            # as protection; alert loudly. Position is UNPROTECTED.
+            logger.critical(f"Protective SL for {sym} @ {trigger} did NOT rest "
+                            f"(id {oid}) — position UNPROTECTED, CHECK TERMINAL.")
+        else:
+            logger.critical(f"Protective SL placement FAILED for {sym} @ {trigger} "
+                            f"— position UNPROTECTED, CHECK TERMINAL.")
         return oid
 
     # ---------------- internals ----------------
@@ -121,8 +140,8 @@ class OrderManager:
             self.sl_orders.pop(sym, None)
 
     def _modify_stoploss(self, inst, qty, trigger, oid):
-        trigger = round(float(trigger), 2)
-        limit = round(trigger - 1.0, 2)
+        trigger = round_to_tick(trigger)          # snap to 0.05 tick
+        limit = round_to_tick(trigger - 1.0)
         params = {
             "variety": "STOPLOSS", "orderid": str(oid),
             "tradingsymbol": inst["symbol"], "symboltoken": inst["token"],
@@ -200,8 +219,8 @@ class OrderManager:
         return self._send(params, f"MARKET {side}")
 
     def _live_stoploss(self, inst, qty, trigger):
-        trigger = round(float(trigger), 2)
-        limit = round(trigger - 1.0, 2)  # SELL SL limit a touch below trigger
+        trigger = round_to_tick(trigger)          # snap to 0.05 tick
+        limit = round_to_tick(trigger - 1.0)      # SELL SL limit below trigger
         params = {
             "variety": "STOPLOSS",
             "tradingsymbol": inst["symbol"],
